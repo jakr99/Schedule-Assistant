@@ -1,0 +1,27 @@
+This is a version history document
+As major changes are made, they will be documented here.
+Minor changes may be added when it may affect other elements.
+
+---
+
+Version beta-00001
+- App file structure created
+
+Version beta-00002
+- Set up PySide6 desktop shell with role-aware login gating and minimal dashboard.
+- Added JSON-backed account store seeded with IT assistant credentials; login dialog enforces authentication.
+
+Version beta-00003
+- Hardened authentication: migrated to salted PBKDF2 hashes, added self-service password change, and enforced role-based account creation/deletion rules.
+- Introduced project launcher to create/manage `.venv` and install dependencies to run the app consistently across machines.
+
+Version beta-00004
+- Implemented centralized audit logging for login attempts and account lifecycle events.
+- Added configurable login lockout policy with status in the account manager table.
+
+Version beta-00005
+- Added BWW-specific role presets and month/year start date tracking for each employee.
+- Stood up a SQLite/SQLAlchemy data layer and added employee CRUD with active/inactive filtering plus availability windows.
+- Employee directory UI now logs create/update/status changes and manages unavailability with audit coverage.
+- Introduced persistent week selector with saved contexts and audit trail.
+- Added inactivity timeout with 9-minute warning and auto sign-out at 10 minutes.

@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local databases and logs
+app/data/*.db
+app/data/*.sqlite
+app/data/*.sqlite3
+app/data/audit.log
+
+# Sensitive seeded data
+app/data/accounts.json
+TODO.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build / packaging output
+dist/
+build/
+*.egg-info/
+app/data/week_state.json
