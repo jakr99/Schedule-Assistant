@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
-from typing import Iterable, List
+from typing import Dict, Iterable, List
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, select, text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.types import Time
 
@@ -85,6 +85,57 @@ class WeekContext(Base):
 
     __table_args__ = (UniqueConstraint("iso_year", "iso_week", name="uq_week_context_year_week"),)
 
+    projections: Mapped[List["WeekDailyProjection"]] = relationship(
+        back_populates="week", cascade="all, delete-orphan"
+    )
+    modifiers: Mapped[List["Modifier"]] = relationship(
+        back_populates="week", cascade="all, delete-orphan"
+    )
+
+
+class WeekDailyProjection(Base):
+    __tablename__ = "week_daily_projections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    week_id: Mapped[int] = mapped_column(ForeignKey("week_context.id", ondelete="CASCADE"), nullable=False)
+    day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)
+    projected_sales_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    projected_notes: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.datetime.now(datetime.timezone.utc),
+        onupdate=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    week: Mapped[WeekContext] = relationship(back_populates="projections")
+
+    __table_args__ = (UniqueConstraint("week_id", "day_of_week", name="uq_daily_projection_week_day"),)
+
+
+class Modifier(Base):
+    __tablename__ = "modifiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    week_id: Mapped[int] = mapped_column(ForeignKey("week_context.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    modifier_type: Mapped[str] = mapped_column(String(24), nullable=False, default="increase")
+    day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_time: Mapped[datetime.time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[datetime.time] = mapped_column(Time, nullable=False)
+    pct_change: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(String(60), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.datetime.now(datetime.timezone.utc)
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.datetime.now(datetime.timezone.utc),
+        onupdate=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    week: Mapped[WeekContext] = relationship(back_populates="modifiers")
+
 
 engine = create_engine(
     DATABASE_URL,
@@ -105,6 +156,21 @@ def init_database() -> None:
             conn.execute(text("ALTER TABLE employees ADD COLUMN start_month INTEGER"))
         if "start_year" not in columns:
             conn.execute(text("ALTER TABLE employees ADD COLUMN start_year INTEGER"))
+        table_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='week_daily_projections'")
+        ).scalar()
+        if table_exists:
+            projection_columns = {
+                row[1]: True
+                for row in conn.execute(text("PRAGMA table_info(week_daily_projections)"))
+            }
+            if "projected_sales_amount" not in projection_columns and "projected_labor_hours" in projection_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE week_daily_projections "
+                        "RENAME COLUMN projected_labor_hours TO projected_sales_amount"
+                    )
+                )
 
 
 def get_all_employees(session) -> List[Employee]:
@@ -130,3 +196,47 @@ def get_or_create_week(session, iso_year: int, iso_week: int, label: str) -> Wee
     session.commit()
     session.refresh(week)
     return week
+
+
+def get_week_daily_projections(session, week_id: int) -> List[WeekDailyProjection]:
+    stmt = select(WeekDailyProjection).where(WeekDailyProjection.week_id == week_id)
+    projections = {item.day_of_week: item for item in session.scalars(stmt)}
+    created = False
+    for day in range(7):
+        if day not in projections:
+            projection = WeekDailyProjection(week_id=week_id, day_of_week=day, projected_sales_amount=0.0)
+            session.add(projection)
+            projections[day] = projection
+            created = True
+    if created:
+        session.commit()
+        for projection in projections.values():
+            session.refresh(projection)
+    return [projections[day] for day in sorted(projections)]
+
+
+def save_week_daily_projection_values(
+    session,
+    week_id: int,
+    values: Dict[int, Dict[str, float | str]],
+) -> None:
+    projections = get_week_daily_projections(session, week_id)
+    mapping = {item.day_of_week: item for item in projections}
+    for day, payload in values.items():
+        projection = mapping.get(day)
+        if not projection:
+            continue
+        amount = float(payload.get("projected_sales_amount", projection.projected_sales_amount))
+        notes = str(payload.get("projected_notes", projection.projected_notes or ""))
+        projection.projected_sales_amount = max(amount, 0.0)
+        projection.projected_notes = notes.strip()
+    session.commit()
+
+
+def get_week_modifiers(session, week_id: int) -> List[Modifier]:
+    stmt = (
+        select(Modifier)
+        .where(Modifier.week_id == week_id)
+        .order_by(Modifier.day_of_week, Modifier.start_time, Modifier.id)
+    )
+    return list(session.scalars(stmt))

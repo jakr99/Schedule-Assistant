@@ -13,15 +13,17 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -34,7 +36,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
-    QDateEdit,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -44,11 +45,16 @@ from PySide6.QtWidgets import (
 from database import (
     Employee,
     EmployeeUnavailability,
+    Modifier,
     SessionLocal,
+    WeekDailyProjection,
     get_all_employees,
     get_all_weeks,
     get_or_create_week,
+    get_week_daily_projections,
+    get_week_modifiers,
     init_database,
+    save_week_daily_projection_values,
 )
 
 
@@ -106,6 +112,12 @@ def save_active_week(iso_year: int, iso_week: int) -> None:
         json.dumps({"iso_year": iso_year, "iso_week": iso_week}),
         encoding="utf-8",
     )
+
+
+def format_time_label(value: datetime.time) -> str:
+    hour = value.hour % 12 or 12
+    suffix = "AM" if value.hour < 12 else "PM"
+    return f"{hour}:{value.minute:02d} {suffix}"
 EMPLOYEE_ROLE_GROUPS = {
     "Managers": [
         "Manager FOH",
@@ -848,6 +860,656 @@ class WeekSelectorWidget(QWidget):
         self.set_active_week({"iso_year": iso_year, "iso_week": iso_week, "label": label})
         if self.on_change:
             self.on_change(iso_year, iso_week, label)
+
+
+class ModifierDialog(QDialog):
+    TIME_CHOICES = [datetime.time(hour % 24, 0) for hour in list(range(2, 24)) + [0, 1]]
+
+    def __init__(
+        self,
+        existing_modifiers: List[Modifier],
+        *,
+        modifier: Optional[Modifier] = None,
+    ) -> None:
+        super().__init__()
+        self.existing_modifiers = existing_modifiers
+        self.edit_modifier = modifier
+        self.result_data: Optional[Dict[str, Any]] = None
+        self.setWindowTitle("Edit modifier" if modifier else "Add modifier")
+        self._build_ui()
+        if modifier:
+            self._load_modifier(modifier)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Adjust projected sales for a specific day and window. "
+            "Modifiers apply on top of the base projection."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("e.g. Game Day Surge")
+        form.addRow("Title", self.title_input)
+
+        self.day_combo = QComboBox()
+        self.day_combo.addItems(DAYS_OF_WEEK)
+        form.addRow("Day of week", self.day_combo)
+
+        time_row = QHBoxLayout()
+        self.start_time_combo = self._build_time_combo()
+        self._set_combo_to_time(self.start_time_combo, datetime.time(16, 0))
+        time_row.addWidget(self.start_time_combo)
+        time_row.addWidget(QLabel("to"))
+        self.end_time_combo = self._build_time_combo()
+        self._set_combo_to_time(self.end_time_combo, datetime.time(21, 0))
+        time_row.addWidget(self.end_time_combo)
+        form.addRow("Time window", time_row)
+
+        impact_row = QHBoxLayout()
+        self.sign_combo = QComboBox()
+        self.sign_combo.addItem("Increase (+)", 1)
+        self.sign_combo.addItem("Decrease (-)", -1)
+        impact_row.addWidget(self.sign_combo)
+        self.pct_input = QSpinBox()
+        self.pct_input.setRange(1, 400)
+        self.pct_input.setSuffix(" %")
+        self.pct_input.setValue(10)
+        impact_row.addWidget(self.pct_input)
+        impact_row.addStretch()
+        form.addRow("Percent change", impact_row)
+
+        self.notes_input = QLineEdit()
+        self.notes_input.setPlaceholderText("Optional note")
+        form.addRow("Notes", self.notes_input)
+
+        layout.addLayout(form)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setStyleSheet("color:#ff6b6b;")
+        layout.addWidget(self.feedback_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _load_modifier(self, modifier: Modifier) -> None:
+        self.title_input.setText(modifier.title)
+        self.day_combo.setCurrentIndex(modifier.day_of_week)
+        self._set_combo_to_time(self.start_time_combo, modifier.start_time)
+        self._set_combo_to_time(self.end_time_combo, modifier.end_time)
+        self.sign_combo.setCurrentIndex(0 if modifier.pct_change >= 0 else 1)
+        self.pct_input.setValue(abs(modifier.pct_change))
+        self.notes_input.setText(modifier.notes or "")
+
+    def _build_time_combo(self) -> QComboBox:
+        combo = QComboBox()
+        for value in self.TIME_CHOICES:
+            combo.addItem(format_time_label(value), value)
+        return combo
+
+    @staticmethod
+    def _set_combo_to_time(combo: QComboBox, value: datetime.time) -> None:
+        index = combo.findData(value)
+        if index != -1:
+            combo.setCurrentIndex(index)
+
+    def _windows_overlap(
+        self,
+        day: int,
+        start: datetime.time,
+        end: datetime.time,
+        ignore_id: Optional[int],
+    ) -> Optional[Modifier]:
+        def normalize(window_start: datetime.time, window_end: datetime.time) -> tuple[int, int]:
+            start_minutes = window_start.hour * 60 + window_start.minute
+            end_minutes = window_end.hour * 60 + window_end.minute
+            if end_minutes <= start_minutes:
+                end_minutes += 24 * 60
+            return start_minutes, end_minutes
+
+        start_minutes, end_minutes = normalize(start, end)
+        for existing in self.existing_modifiers:
+            if ignore_id and existing.id == ignore_id:
+                continue
+            if existing.day_of_week != day:
+                continue
+            existing_start, existing_end = normalize(existing.start_time, existing.end_time)
+            for offset in (0, 24 * 60, -24 * 60):
+                shifted_start = existing_start + offset
+                shifted_end = existing_end + offset
+                if start_minutes < shifted_end and end_minutes > shifted_start:
+                    return existing
+        return None
+
+    def accept(self) -> None:  # type: ignore[override]
+        title = self.title_input.text().strip()
+        if not title:
+            self.feedback_label.setText("Provide a title so the team knows why this modifier exists.")
+            self.title_input.setFocus()
+            return
+
+        start_value: Optional[datetime.time] = self.start_time_combo.currentData()
+        end_value: Optional[datetime.time] = self.end_time_combo.currentData()
+        if start_value is None or end_value is None:
+            self.feedback_label.setText("Select both start and end times.")
+            return
+
+        sign = self.sign_combo.currentData()
+        if sign not in (-1, 1):
+            sign = 1
+        pct_change = int(self.pct_input.value() * sign)
+
+        day_index = self.day_combo.currentIndex()
+        ignore_id = self.edit_modifier.id if self.edit_modifier else None
+        overlap = self._windows_overlap(day_index, start_value, end_value, ignore_id)
+        if overlap:
+            self.feedback_label.setText(
+                f"Overlaps with '{overlap.title}' ({DAYS_OF_WEEK[overlap.day_of_week]} "
+                f"{overlap.start_time.strftime('%H:%M')}–{overlap.end_time.strftime('%H:%M')})."
+            )
+            return
+
+        self.result_data = {
+            "title": title,
+            "day_of_week": day_index,
+            "start_time": start_value,
+            "end_time": end_value,
+            "pct_change": pct_change,
+            "notes": self.notes_input.text().strip(),
+        }
+        super().accept()
+
+
+class DemandPlanningWidget(QWidget):
+    def __init__(self, session_factory, actor: Dict[str, Any], active_week: Dict[str, Any]) -> None:
+        super().__init__()
+        self.session_factory = session_factory
+        self.actor = actor
+        self.active_week = active_week
+        self.week_id: Optional[int] = None
+        self.week_label: str = active_week.get("label", "")
+        self.projections: List[WeekDailyProjection] = []
+        self.modifiers: List[Modifier] = []
+        self.day_inputs: Dict[int, QLineEdit] = {}
+        self.day_note_inputs: Dict[int, QLineEdit] = {}
+        self.heat_labels: Dict[int, QLabel] = {}
+        self._pending_changes = False
+        self._modifier_column_ratios: Dict[int, float] = {
+            0: 0.20,  # Title
+            1: 0.12,  # Impact
+            2: 0.12,  # Day
+            3: 0.18,  # Window
+            4: 0.10,  # % Change
+            5: 0.14,  # Applied by
+            6: 0.14,  # Notes
+        }
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(18)
+
+        self.projection_group = QGroupBox("Projected sales by day")
+        projection_layout = QVBoxLayout(self.projection_group)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("<b>Day</b>"), 0, 0)
+        grid.addWidget(QLabel("<b>Projected sales ($)</b>"), 0, 1)
+        grid.addWidget(QLabel("<b>Notes</b>"), 0, 2)
+
+        for day_index, day_name in enumerate(DAYS_OF_WEEK):
+            label = QLabel(day_name)
+            grid.addWidget(label, day_index + 1, 0)
+
+            amount_input = QLineEdit()
+            amount_input.setPlaceholderText("Projected sales")
+            amount_input.setAlignment(Qt.AlignRight)
+            amount_input.setValidator(QIntValidator(0, 9_999_999, amount_input))
+            amount_input.setMaxLength(9)
+            amount_input.setClearButtonEnabled(True)
+            amount_input.textEdited.connect(self._handle_projection_field_edited)
+            grid.addWidget(amount_input, day_index + 1, 1)
+            self.day_inputs[day_index] = amount_input
+
+            note_input = QLineEdit()
+            note_input.setPlaceholderText("Optional context")
+            note_input.textEdited.connect(self._handle_projection_field_edited)
+            grid.addWidget(note_input, day_index + 1, 2)
+            self.day_note_inputs[day_index] = note_input
+
+        projection_layout.addLayout(grid)
+
+        buttons_row = QHBoxLayout()
+        self.save_status_label = QLabel()
+        buttons_row.addWidget(self.save_status_label)
+        buttons_row.addStretch()
+        self.save_button = QPushButton("Save daily projections")
+        self.save_button.clicked.connect(self.handle_save_projections)
+        buttons_row.addWidget(self.save_button)
+        projection_layout.addLayout(buttons_row)
+        self._set_saved_state(True)
+
+        layout.addWidget(self.projection_group)
+
+        self.heat_group = QGroupBox("Sales heat map")
+        heat_layout = QVBoxLayout(self.heat_group)
+        heat_hint = QLabel(
+            "Derived from projected sales and modifiers. Cool blues indicate slower days, red indicates higher sales volume expectations."
+        )
+        heat_hint.setWordWrap(True)
+        heat_layout.addWidget(heat_hint)
+
+        heat_row = QHBoxLayout()
+        heat_row.setSpacing(8)
+        for day_index, day_name in enumerate(DAYS_OF_WEEK):
+            label = QLabel(day_name)
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumWidth(100)
+            label.setFixedHeight(72)
+            label.setStyleSheet(
+                "border:1px solid #334155; border-radius:6px; background-color:#1e2937; color:#e2e8f0;"
+            )
+            self.heat_labels[day_index] = label
+            heat_row.addWidget(label)
+        heat_row.addStretch()
+        heat_layout.addLayout(heat_row)
+
+        layout.addWidget(self.heat_group)
+
+        self.modifier_group = QGroupBox("Modifiers")
+        modifier_layout = QVBoxLayout(self.modifier_group)
+
+        self.modifier_table = QTableWidget(0, 7)
+        self.modifier_table.setHorizontalHeaderLabels(
+            ["Title", "Impact", "Day", "Window", "% Change", "Applied by", "Notes"]
+        )
+        self.modifier_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.modifier_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.modifier_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        header = self.modifier_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(80)
+        for column in range(self.modifier_table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        self.modifier_table.itemSelectionChanged.connect(self._update_modifier_buttons)
+        modifier_layout.addWidget(self.modifier_table)
+        self._apply_modifier_column_layout()
+
+        self.modifier_feedback = QLabel()
+        self.modifier_feedback.setStyleSheet("color:#9f9f9f;")
+        modifier_layout.addWidget(self.modifier_feedback)
+
+        modifier_buttons = QHBoxLayout()
+        self.add_modifier_button = QPushButton("Add modifier")
+        self.add_modifier_button.clicked.connect(self.handle_add_modifier)
+        modifier_buttons.addWidget(self.add_modifier_button)
+
+        self.edit_modifier_button = QPushButton("Edit")
+        self.edit_modifier_button.clicked.connect(self.handle_edit_modifier)
+        modifier_buttons.addWidget(self.edit_modifier_button)
+
+        self.delete_modifier_button = QPushButton("Delete")
+        self.delete_modifier_button.clicked.connect(self.handle_delete_modifier)
+        modifier_buttons.addWidget(self.delete_modifier_button)
+        modifier_buttons.addStretch()
+        modifier_layout.addLayout(modifier_buttons)
+
+        layout.addWidget(self.modifier_group)
+        layout.addStretch(1)
+
+    def set_active_week(self, active_week: Dict[str, Any]) -> None:
+        self.active_week = active_week
+        self.week_label = active_week.get("label", "")
+        self.refresh()
+
+    def refresh(self) -> None:
+        iso_year = self.active_week.get("iso_year")
+        iso_week = self.active_week.get("iso_week")
+        label = self.active_week.get("label") or ""
+        with self.session_factory() as session:
+            week = get_or_create_week(session, iso_year, iso_week, label)
+            self.week_id = week.id
+            self.week_label = week.label
+            self.projections = get_week_daily_projections(session, week.id)
+            self.modifiers = get_week_modifiers(session, week.id)
+        self._populate_projection_inputs()
+        self._refresh_modifiers_table()
+        self._apply_heatmap()
+        self._update_group_titles()
+        self._update_modifier_buttons()
+
+    def _update_group_titles(self) -> None:
+        suffix = f" – {self.week_label}" if self.week_label else ""
+        self.projection_group.setTitle(f"Projected sales by day{suffix}")
+        self.modifier_group.setTitle(f"Modifiers{suffix}")
+        self.heat_group.setTitle(f"Sales heat map{suffix}")
+
+    def _apply_modifier_column_layout(self) -> None:
+        if not hasattr(self, "modifier_table"):
+            return
+        header = self.modifier_table.horizontalHeader()
+        total_width = self.modifier_table.viewport().width()
+        if total_width <= 0:
+            total_width = header.length()
+        if total_width <= 0:
+            total_width = self.modifier_table.width()
+        if total_width <= 0:
+            return
+        columns = sorted(self._modifier_column_ratios.keys())
+        widths: Dict[int, int] = {}
+        total_assigned = 0
+        for column in columns:
+            ratio = self._modifier_column_ratios.get(column, 0.0)
+            min_width = 140 if column == 0 else 80
+            width = max(int(total_width * ratio), min_width)
+            widths[column] = width
+            total_assigned += width
+        if columns:
+            last_column = columns[-1]
+            min_width = 140 if last_column == 0 else 80
+            widths[last_column] = max(widths[last_column] + (total_width - total_assigned), min_width)
+        for column in columns:
+            header.resizeSection(column, widths[column])
+
+    def _populate_projection_inputs(self) -> None:
+        mapping = {projection.day_of_week: projection for projection in self.projections}
+        for day, field in self.day_inputs.items():
+            projection = mapping.get(day)
+            value = projection.projected_sales_amount if projection else 0.0
+            field.blockSignals(True)
+            field.setText(f"{int(round(value))}" if value else "")
+            field.blockSignals(False)
+            note = projection.projected_notes if projection else ""
+            note_field = self.day_note_inputs[day]
+            note_field.blockSignals(True)
+            note_field.setText(note)
+            note_field.blockSignals(False)
+        self._set_saved_state(True)
+
+    def _handle_projection_field_edited(self, _text: str) -> None:
+        self._mark_unsaved()
+
+    def _set_saved_state(self, saved: bool) -> None:
+        if saved:
+            self.save_status_label.setText("All changes saved")
+            self.save_status_label.setStyleSheet("color:#3cb371;")
+            self._pending_changes = False
+        else:
+            self.save_status_label.setText("Unsaved changes")
+            self.save_status_label.setStyleSheet("color:#ffd166;")
+            self._pending_changes = True
+
+    def _mark_unsaved(self) -> None:
+        if not self._pending_changes:
+            self._set_saved_state(False)
+
+    def handle_save_projections(self) -> None:
+        if self.week_id is None:
+            return
+        payload: Dict[int, Dict[str, float | str]] = {}
+        for day, field in self.day_inputs.items():
+            text_value = field.text().strip()
+            amount = float(int(text_value)) if text_value else 0.0
+            payload[day] = {
+                "projected_sales_amount": amount,
+                "projected_notes": self.day_note_inputs[day].text().strip(),
+            }
+        with self.session_factory() as session:
+            save_week_daily_projection_values(session, self.week_id, payload)
+        audit_logger.log(
+            "sales_projection_update",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={
+                "iso_year": self.active_week.get("iso_year"),
+                "iso_week": self.active_week.get("iso_week"),
+                "values": {day: payload[day]["projected_sales_amount"] for day in payload},
+            },
+        )
+        self._set_saved_state(True)
+        self.refresh()
+
+    def _apply_heatmap(self) -> None:
+        summaries = []
+        projection_map = {projection.day_of_week: projection for projection in self.projections}
+        for day in range(7):
+            projection = projection_map.get(day)
+            base_sales = float(projection.projected_sales_amount) if projection else 0.0
+            day_modifiers = [modifier for modifier in self.modifiers if modifier.day_of_week == day]
+            net_pct = 0.0
+            modifier_descriptions: List[str] = []
+            for modifier in day_modifiers:
+                net_pct += modifier.pct_change
+                descriptor = (
+                    f"{modifier.title} "
+                    f"{modifier.pct_change:+d}% "
+                    f"{format_time_label(modifier.start_time)}–{format_time_label(modifier.end_time)}"
+                )
+                modifier_descriptions.append(descriptor)
+            adjusted_sales = max(base_sales * (1 + net_pct / 100.0), 0.0)
+            summaries.append(
+                {
+                    "day": day,
+                    "base": base_sales,
+                    "net_pct": net_pct,
+                    "adjusted": adjusted_sales,
+                    "count": len(day_modifiers),
+                    "descriptions": modifier_descriptions,
+                }
+            )
+
+        adjusted_values = [summary["adjusted"] for summary in summaries]
+        max_value = max(adjusted_values) if adjusted_values else 0.0
+        min_value = min(adjusted_values) if adjusted_values else 0.0
+
+        for summary in summaries:
+            day = summary["day"]
+            label = self.heat_labels[day]
+            base = summary["base"]
+            adjusted = summary["adjusted"]
+            net_pct = summary["net_pct"]
+            modifier_text = ", ".join(summary["descriptions"]) or "No modifiers"
+            label.setToolTip(
+                f"Base: {self._format_currency(base)}\n"
+                f"Adjusted: {self._format_currency(adjusted)}\n"
+                f"Net change: {net_pct:+.0f}%\n"
+                f"Modifiers: {modifier_text}"
+            )
+            if max_value == min_value:
+                ratio = 0.0 if adjusted <= 0 else 0.6
+            else:
+                ratio = (adjusted - min_value) / (max_value - min_value)
+            palette = self._heat_color(ratio, adjusted > 0 or base > 0)
+            label.setStyleSheet(
+                f"border:1px solid #334155; border-radius:6px; color:#e2e8f0; background-color:{palette};"
+            )
+            delta = adjusted - base
+            label.setText(
+                f"{DAYS_OF_WEEK[day]}\n{self._format_currency(adjusted)}\n{self._format_delta(delta)}"
+            )
+
+    @staticmethod
+    def _format_currency(value: float) -> str:
+        rounded = round(value)
+        sign = "-" if rounded < 0 else ""
+        return f"{sign}${abs(rounded):,}"
+
+    @staticmethod
+    def _format_delta(value: float) -> str:
+        rounded = round(value)
+        if rounded == 0:
+            return "±$0"
+        sign = "+" if rounded > 0 else "-"
+        return f"{sign}${abs(rounded):,}"
+
+    def _heat_color(self, ratio: float, has_value: bool) -> str:
+        if not has_value:
+            return "#1e2937"
+        ratio = max(0.0, min(1.0, ratio))
+        start_rgb = (29, 78, 216)  # calm blue
+        end_rgb = (220, 38, 38)  # bold red
+        r = int(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * ratio)
+        g = int(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * ratio)
+        b = int(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * ratio)
+        return f"rgb({r}, {g}, {b})"
+
+    def _refresh_modifiers_table(self) -> None:
+        self.modifier_table.setRowCount(len(self.modifiers))
+        for row, modifier in enumerate(self.modifiers):
+            type_label = "Increase" if modifier.pct_change >= 0 else "Decrease"
+            change_text = f"{modifier.pct_change:+d}%"
+            day_text = DAYS_OF_WEEK[modifier.day_of_week]
+            window_text = f"{format_time_label(modifier.start_time)} – {format_time_label(modifier.end_time)}"
+            notes_text = modifier.notes or ""
+
+            title_item = QTableWidgetItem(modifier.title)
+            title_item.setData(Qt.UserRole, modifier.id)
+            self.modifier_table.setItem(row, 0, title_item)
+            self.modifier_table.setItem(row, 1, QTableWidgetItem(type_label))
+            self.modifier_table.setItem(row, 2, QTableWidgetItem(day_text))
+            self.modifier_table.setItem(row, 3, QTableWidgetItem(window_text))
+            self.modifier_table.setItem(row, 4, QTableWidgetItem(change_text))
+            self.modifier_table.setItem(row, 5, QTableWidgetItem(modifier.created_by))
+            self.modifier_table.setItem(row, 6, QTableWidgetItem(notes_text))
+
+        self._apply_modifier_column_layout()
+
+    def _selected_modifier(self) -> Optional[Modifier]:
+        selection = self.modifier_table.selectionModel()
+        if not selection or not selection.hasSelection():
+            return None
+        row = selection.currentIndex().row()
+        if row < 0 or row >= len(self.modifiers):
+            return None
+        return self.modifiers[row]
+
+    def _update_modifier_buttons(self) -> None:
+        has_selection = self._selected_modifier() is not None
+        self.edit_modifier_button.setEnabled(has_selection)
+        self.delete_modifier_button.setEnabled(has_selection)
+
+    def handle_add_modifier(self) -> None:
+        dialog = ModifierDialog(self.modifiers)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data or self.week_id is None:
+            return
+        data = dialog.result_data
+        with self.session_factory() as session:
+            modifier = Modifier(
+                week_id=self.week_id,
+                title=data["title"],
+                modifier_type="increase" if int(data["pct_change"]) >= 0 else "decrease",
+                day_of_week=int(data["day_of_week"]),
+                start_time=data["start_time"],
+                end_time=data["end_time"],
+                pct_change=int(data["pct_change"]),
+                notes=data.get("notes", ""),
+                created_by=self.actor.get("username", "unknown"),
+            )
+            session.add(modifier)
+            session.commit()
+            session.refresh(modifier)
+        audit_logger.log(
+            "modifier_create",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={
+                "modifier_id": modifier.id,
+                "week_id": self.week_id,
+                "title": modifier.title,
+                "modifier_type": modifier.modifier_type,
+                "day_of_week": modifier.day_of_week,
+                "start_time": modifier.start_time.isoformat(),
+                "end_time": modifier.end_time.isoformat(),
+                "pct_change": modifier.pct_change,
+            },
+        )
+        self.modifier_feedback.setStyleSheet("color:#3cb371;")
+        self.modifier_feedback.setText(f"Added modifier '{modifier.title}'.")
+        self.refresh()
+
+    def handle_edit_modifier(self) -> None:
+        current = self._selected_modifier()
+        if not current or self.week_id is None:
+            return
+        dialog = ModifierDialog(self.modifiers, modifier=current)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
+            return
+        data = dialog.result_data
+        impact_type = "increase" if int(data["pct_change"]) >= 0 else "decrease"
+        with self.session_factory() as session:
+            modifier = session.get(Modifier, current.id)
+            if not modifier:
+                QMessageBox.warning(self, "Modifier missing", "The selected modifier no longer exists.")
+                self.refresh()
+                return
+            modifier.title = data["title"]
+            modifier.modifier_type = impact_type
+            modifier.day_of_week = int(data["day_of_week"])
+            modifier.start_time = data["start_time"]
+            modifier.end_time = data["end_time"]
+            modifier.pct_change = int(data["pct_change"])
+            modifier.notes = data.get("notes", "")
+            session.commit()
+        audit_logger.log(
+            "modifier_update",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={
+                "modifier_id": current.id,
+                "week_id": self.week_id,
+                "title": data["title"],
+                "modifier_type": impact_type,
+                "day_of_week": int(data["day_of_week"]),
+                "start_time": data["start_time"].isoformat(),
+                "end_time": data["end_time"].isoformat(),
+                "pct_change": int(data["pct_change"]),
+            },
+        )
+        self.modifier_feedback.setStyleSheet("color:#3cb371;")
+        self.modifier_feedback.setText(f"Updated modifier '{data['title']}'.")
+        self.refresh()
+
+    def handle_delete_modifier(self) -> None:
+        current = self._selected_modifier()
+        if not current or self.week_id is None:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Delete modifier",
+            f"Remove modifier '{current.title}'?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        with self.session_factory() as session:
+            modifier = session.get(Modifier, current.id)
+            if modifier:
+                session.delete(modifier)
+                session.commit()
+        audit_logger.log(
+            "modifier_delete",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={
+                "modifier_id": current.id,
+                "week_id": self.week_id,
+                "title": current.title,
+            },
+        )
+        self.modifier_feedback.setStyleSheet("color:#ffd166;")
+        self.modifier_feedback.setText(f"Deleted modifier '{current.title}'.")
+        self.refresh()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_modifier_column_layout()
 
 
 class EmployeeEditDialog(QDialog):
@@ -1634,8 +2296,8 @@ class MainWindow(QMainWindow):
         role_label = QLabel(f"Current role: <b>{self.user['role']}</b>")
         role_label.setStyleSheet("color:#ddd;")
         intro = QLabel(
-            "The scheduling workspace will appear here. Use the controls below to continue. "
-            "Authentication is required to reach this dashboard."
+            "Use the demand planning workspace below to capture projected sales and highlight high-impact days "
+            "before the scheduling pass."
         )
         intro.setWordWrap(True)
 
@@ -1671,14 +2333,14 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(12)
         layout.addWidget(intro)
-        layout.addSpacing(20)
+        layout.addSpacing(16)
 
-        placeholder = QLabel(
-            "<i>Placeholder: scheduling dashboards and data entry tools will live here.</i>"
+        self.demand_widget = DemandPlanningWidget(
+            self.session_factory,
+            self.user,
+            self.active_week,
         )
-        placeholder.setStyleSheet("color:#9f9f9f;")
-        layout.addSpacing(30)
-        layout.addWidget(placeholder)
+        layout.addWidget(self.demand_widget)
         layout.addStretch(1)
 
         footer_row = QHBoxLayout()
@@ -1704,6 +2366,8 @@ class MainWindow(QMainWindow):
             return
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
         save_active_week(iso_year, iso_week)
+        if hasattr(self, "demand_widget") and self.demand_widget:
+            self.demand_widget.set_active_week(self.active_week)
         audit_logger.log(
             "week_context_change",
             self.user["username"],
