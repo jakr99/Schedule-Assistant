@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -1282,16 +1283,28 @@ class DemandPlanningWidget(QWidget):
             projection = projection_map.get(day)
             base_sales = float(projection.projected_sales_amount) if projection else 0.0
             day_modifiers = [modifier for modifier in self.modifiers if modifier.day_of_week == day]
+            # Weight modifiers by the portion of their window that falls within this day.
             net_pct = 0.0
             modifier_descriptions: List[str] = []
             for modifier in day_modifiers:
-                net_pct += modifier.pct_change
+                frac = self._modifier_fraction_within_day(modifier.start_time, modifier.end_time)
+                net_pct += modifier.pct_change * frac
                 descriptor = (
                     f"{modifier.title} "
                     f"{modifier.pct_change:+d}% "
                     f"{format_time_label(modifier.start_time)}–{format_time_label(modifier.end_time)}"
                 )
                 modifier_descriptions.append(descriptor)
+
+            # Add carryover from previous day's wrapping modifiers (past-midnight portion)
+            prev_day = (day - 1) % 7
+            for m in self.modifiers:
+                if m.day_of_week != prev_day:
+                    continue
+                if m.end_time <= m.start_time:
+                    carry_frac = self._modifier_fraction_carryover_from_previous(m.start_time, m.end_time)
+                    if carry_frac > 0:
+                        net_pct += m.pct_change * carry_frac
             adjusted_sales = max(base_sales * (1 + net_pct / 100.0), 0.0)
             summaries.append(
                 {
@@ -1318,7 +1331,7 @@ class DemandPlanningWidget(QWidget):
             label.setToolTip(
                 f"Base: {self._format_currency(base)}\n"
                 f"Adjusted: {self._format_currency(adjusted)}\n"
-                f"Net change: {net_pct:+.0f}%\n"
+                f"Net change: {net_pct:+.1f}%\n"
                 f"Modifiers: {modifier_text}"
             )
             if max_value == min_value:
@@ -1333,6 +1346,32 @@ class DemandPlanningWidget(QWidget):
             label.setText(
                 f"{DAYS_OF_WEEK[day]}\n{self._format_currency(adjusted)}\n{self._format_delta(delta)}"
             )
+
+    @staticmethod
+    def _modifier_fraction_within_day(start: datetime.time, end: datetime.time) -> float:
+        """Fraction of this day (0:00–24:00) covered by the window.
+        If the window wraps past midnight (end <= start), only count the portion
+        up to midnight for the same day.
+        """
+        start_minutes = start.hour * 60 + start.minute
+        end_minutes = end.hour * 60 + end.minute
+        if end_minutes > start_minutes:
+            duration = end_minutes - start_minutes
+        else:
+            duration = (24 * 60) - start_minutes
+        return max(0.0, min(1.0, duration / (24 * 60)))
+
+    @staticmethod
+    def _modifier_fraction_carryover_from_previous(start: datetime.time, end: datetime.time) -> float:
+        """For a previous-day window that wraps past midnight, fraction that spills into the current day.
+        Non-wrapping windows contribute zero to the next day.
+        """
+        start_minutes = start.hour * 60 + start.minute
+        end_minutes = end.hour * 60 + end.minute
+        if end_minutes <= start_minutes:
+            duration = end_minutes  # 0:00 to end on the next day
+            return max(0.0, min(1.0, duration / (24 * 60)))
+        return 0.0
 
     @staticmethod
     def _format_currency(value: float) -> str:
@@ -2288,8 +2327,13 @@ class MainWindow(QMainWindow):
         self._init_session_timeout()
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        layout = QVBoxLayout(central)
+        # Wrap the entire central content in a scroll area so the app is
+        # traversible on smaller displays and different Windows variants.
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setAlignment(Qt.AlignTop)
         display_name = self.user.get("display_name", self.user["username"])
         welcome = QLabel(f"<h1 style='color:#b8860b;'>Welcome, {display_name}!</h1>")
@@ -2356,7 +2400,8 @@ class MainWindow(QMainWindow):
         footer_row.addStretch()
         layout.addLayout(footer_row)
 
-        self.setCentralWidget(central)
+        scroll_area.setWidget(content)
+        self.setCentralWidget(scroll_area)
 
     def on_week_changed(self, iso_year: int, iso_week: int, label: str) -> None:
         if (

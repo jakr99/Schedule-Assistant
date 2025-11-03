@@ -25,3 +25,11 @@ Version beta-00005
 - Employee directory UI now logs create/update/status changes and manages unavailability with audit coverage.
 - Introduced persistent week selector with saved contexts and audit trail.
 - Added inactivity timeout with 9-minute warning and auto sign-out at 10 minutes.
+
+Version beta-00006
+- Made main window content scrollable via QScrollArea to ensure traversibility across devices (PC/laptop) and varying screen sizes/DPI.
+
+Version beta-00007
+- Corrected sales heat map math: modifiers now apply proportionally to the time window they occupy, not to the entire day.
+- Added cross‑midnight handling so late-night modifiers contribute their post‑midnight portion to the following day.
+- Kept UI concise: tooltips show a single duration-weighted net change, without per‑modifier daily breakdown.
