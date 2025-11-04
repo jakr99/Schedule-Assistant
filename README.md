@@ -4,17 +4,16 @@ Buffalo Wild Wings Scheduling Assistant built as a hybrid Python project combini
 
 ## Team
 
-- Me
 - Aaron Deken
 - Jacob Lee
 
 ## Technologies
 
 - Python 3.10+
-- PySide6 (Qt for Python) for desktop UI
-- SQLite + SQLAlchemy ORM for local storage
+- PySide6 (Qt for Python) for local UI
+- SQLite + SQLAlchemy ORM for local database
 - FastAPI scaffolding (future API integration)
-- Windows/macOS/Linux compatible
+- Built for Windows 11
 
 ## Project Structure
 
@@ -83,7 +82,7 @@ On first launch (no existing users), an IT Assistant account is available to boo
 - Username: `it_assistant`
 - Password: `letmein`
 
-Use the Account Manager dialog to add GM/SM accounts.
+Use the Account Manager dialog to add GM/SM accounts. It is very important that you change this default accounts password immediately, which can be done easily at the bottom/end of the application.
 
 ## Using the App
 
@@ -106,5 +105,3 @@ Role Access:
 ## Troubleshooting
 
 - If dependencies change, rerun `python launch.py` or delete `.venv` to force a full reinstall.
-- If GUI doesn’t start, ensure your OS has a display server and `PySide6` installed in the venv.
-

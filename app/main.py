@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
-from PySide6.QtGui import QCloseEvent, QIntValidator
+from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,6 +65,7 @@ from database import (
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+ICON_FILE = Path(__file__).resolve().parents[1] / "project_image.ico"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 AUDIT_FILE = DATA_DIR / "audit.log"
 WEEK_STATE_FILE = DATA_DIR / "week_state.json"
@@ -77,6 +78,11 @@ LOCKOUT_MINUTES = 15
 SESSION_WARNING_SECONDS = 9 * 60
 SESSION_TIMEOUT_SECONDS = 10 * 60
 SHOW_POLICY_TO_SM = True
+ACCENT_COLOR = "#f5b942"
+SUCCESS_COLOR = "#66d9a6"
+WARNING_COLOR = "#f5b942"
+INFO_COLOR = "#a8aec6"
+ERROR_COLOR = "#ff7a7a"
 
 
 def week_start_date(iso_year: int, iso_week: int) -> datetime.date:
@@ -180,52 +186,214 @@ DAYS_OF_WEEK = [
 ]
 THEME_STYLESHEET = """
 QWidget {
-    background-color: #0b0b0d;
-    color: #f7f7f7;
+    background-color: #0c0d13;
+    color: #f5f6fa;
     font-family: 'Segoe UI', sans-serif;
-    font-size: 17px;
+    font-size: 15px;
+}
+
+QLabel {
+    color: #f5f6fa;
+}
+
+QFrame, QGroupBox, QDialog, QMenu, QToolTip {
+    background-color: #141722;
+    border: 1px solid #1f2331;
+    border-radius: 12px;
+}
+
+QGroupBox {
+    margin-top: 20px;
+    padding: 20px;
+}
+
+QGroupBox::title {
+    color: #f9d24a;
+    font-weight: 600;
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    margin-left: 14px;
+    padding: 2px 10px;
+    background-color: #141722;
+    border-radius: 8px;
 }
 
 QPushButton {
-    background-color: #b8860b;
-    color: #0b0b0d;
-    border-radius: 7px;
-    padding: 10px 17px;
+    background-color: #f5b942;
+    color: #0d0e13;
+    border-radius: 10px;
+    padding: 10px 22px;
     font-weight: 600;
+    border: none;
+    min-height: 34px;
 }
 
 QPushButton:hover {
-    background-color: #c99821;
+    background-color: #ffd36a;
+}
+
+QPushButton:pressed {
+    background-color: #e0a027;
 }
 
 QPushButton:disabled {
-    background-color: #2a2a2a;
-    color: #777777;
+    background-color: #2a2e3a;
+    color: #74788d;
 }
 
-QLineEdit, QComboBox {
-    background-color: #16161d;
-    border: 1px solid #2c2c33;
-    border-radius: 7px;
-    padding: 7px 12px;
-    color: #f7f7f7;
-}
-
-QLineEdit:focus, QComboBox:focus {
-    border-color: #b8860b;
-}
-
-QTableWidget {
-    background-color: #16161d;
-    border: 1px solid #2c2c33;
+QLineEdit,
+QComboBox,
+QSpinBox,
+QDateEdit,
+QTimeEdit,
+QPlainTextEdit {
+    background-color: #191c29;
+    border: 1px solid #262a38;
     border-radius: 10px;
-    gridline-color: #2c2c33;
+    padding: 8px 14px;
+    color: #f5f6fa;
+    selection-background-color: #f5b942;
+    selection-color: #0d0e13;
+}
+
+QLineEdit::placeholder {
+    color: #9aa0b5;
+}
+
+QComboBox QAbstractItemView::item {
+    color: #9aa0b5;
+}
+
+QLineEdit:focus,
+QComboBox:focus,
+QSpinBox:focus,
+QDateEdit:focus,
+QTimeEdit:focus,
+QPlainTextEdit:focus {
+    border: 1px solid #f5b942;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #11131a;
+    border: 1px solid #262a38;
+    selection-background-color: #f5b942;
+    selection-color: #0d0e13;
+    color: #f5f6fa;
+}
+
+QPlainTextEdit {
+    padding: 12px;
+}
+
+QTabWidget::pane {
+    border: 1px solid #1f2331;
+    border-radius: 10px;
+    background: #0c0d13;
+}
+
+QTabWidget::tab-bar {
+    alignment: left;
+}
+
+QTabBar::tab {
+    background: #0c0d13;
+    color: #f5f6fa;
+    padding: 8px 18px;
+    margin-right: 2px;
+    border: 1px solid #1f2331;
+    border-bottom: none;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+}
+
+QTabBar::tab:selected {
+    background: #141722;
+    color: #f9d24a;
+}
+
+QTabBar::tab:hover {
+    background: #181b26;
+}
+
+QTableWidget,
+QTableView {
+    background-color: #131620;
+    alternate-background-color: #1a1e2c;
+    border: 1px solid #1f2331;
+    border-radius: 12px;
+    gridline-color: #262a38;
+    selection-background-color: #f5b942;
+    selection-color: #0d0e13;
+}
+
+QTableWidget::item,
+QTableView::item {
+    padding: 6px;
 }
 
 QHeaderView::section {
-    background-color: #141418;
-    color: #f7f7f7;
-    padding: 7px;
+    background-color: #0f1119;
+    color: #f5f6fa;
+    padding: 9px 14px;
+    border: none;
+    font-weight: 600;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+QTableCornerButton::section {
+    background-color: #0f1119;
+    border: none;
+}
+
+QListWidget,
+QListView,
+QTreeView {
+    background-color: #131620;
+    border: 1px solid #1f2331;
+    border-radius: 12px;
+    selection-background-color: #f5b942;
+    selection-color: #0d0e13;
+}
+
+QListWidget::item,
+QListView::item,
+QTreeView::item {
+    padding: 6px 10px;
+}
+
+QScrollArea {
+    border: none;
+    background-color: transparent;
+}
+
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+QScrollBar:vertical,
+QScrollBar:horizontal {
+    background: transparent;
+    border: none;
+    margin: 4px;
+    width: 12px;
+    height: 12px;
+}
+
+QScrollBar::handle {
+    background: #2e3343;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:hover {
+    background: #3a4053;
+}
+
+QScrollBar::add-line,
+QScrollBar::sub-line,
+QScrollBar::add-page,
+QScrollBar::sub-page {
+    background: transparent;
     border: none;
 }
 """
@@ -575,9 +743,9 @@ class LoginDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        heading = QLabel("<h2 style='color:#b8860b;'>Sign in to Schedule Assistant</h2>")
+        heading = QLabel(f"<h2 style='color:{ACCENT_COLOR};'>Sign in to Schedule Assistant</h2>")
         subheading = QLabel("Access is limited to authorized staff.")
-        subheading.setStyleSheet("color:#ddd;")
+        subheading.setStyleSheet("color:#c9cede;")
 
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Username")
@@ -590,7 +758,7 @@ class LoginDialog(QDialog):
         form.addRow("Password", self.password_input)
 
         self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setStyleSheet(f"color:{ERROR_COLOR};")
         self.error_label.setWordWrap(True)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -750,10 +918,10 @@ class AccountManagerDialog(QDialog):
             )
         except (ValueError, PermissionError) as exc:
             self.new_password.clear()
-            self.feedback_label.setText(f"<span style='color:#ff6b6b;'>{exc}</span>")
+            self.feedback_label.setText(f"<span style='color:{ERROR_COLOR};'>{exc}</span>")
             return
 
-        self.feedback_label.setText(f"<span style='color:#3cb371;'>Created {role} account for {username}.</span>")
+        self.feedback_label.setText(f"<span style='color:{SUCCESS_COLOR};'>Created {role} account for {username}.</span>")
         self.new_username.clear()
         self.new_password.clear()
         self.refresh_table()
@@ -761,7 +929,7 @@ class AccountManagerDialog(QDialog):
     def handle_delete(self) -> None:
         selected = self.table.selectedItems()
         if not selected:
-            self.feedback_label.setText("<span style='color:#ff6b6b;'>Select an account to delete.</span>")
+            self.feedback_label.setText(f"<span style='color:{ERROR_COLOR};'>Select an account to delete.</span>")
             return
         username = selected[0].text()
         target_role = selected[1].text()
@@ -781,10 +949,10 @@ class AccountManagerDialog(QDialog):
                 target_username=username,
             )
         except (ValueError, PermissionError) as exc:
-            self.feedback_label.setText(f"<span style='color:#ff6b6b;'>{exc}</span>")
+            self.feedback_label.setText(f"<span style='color:{ERROR_COLOR};'>{exc}</span>")
             return
 
-        self.feedback_label.setText(f"<span style='color:#3cb371;'>Deleted account '{username}'.</span>")
+        self.feedback_label.setText(f"<span style='color:{SUCCESS_COLOR};'>Deleted account '{username}'.</span>")
         self.refresh_table()
 
 
@@ -943,7 +1111,7 @@ class ModifierDialog(QDialog):
         layout.addLayout(form)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color:#ff6b6b;")
+        self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1126,9 +1294,8 @@ class DemandPlanningWidget(QWidget):
             label.setAlignment(Qt.AlignCenter)
             label.setMinimumWidth(100)
             label.setFixedHeight(72)
-            label.setStyleSheet(
-                "border:1px solid #334155; border-radius:6px; background-color:#1e2937; color:#e2e8f0;"
-            )
+            label.setWordWrap(True)
+            label.setStyleSheet(self._heat_label_style())
             self.heat_labels[day_index] = label
             heat_row.addWidget(label)
         heat_row.addStretch()
@@ -1156,7 +1323,7 @@ class DemandPlanningWidget(QWidget):
         self._apply_modifier_column_layout()
 
         self.modifier_feedback = QLabel()
-        self.modifier_feedback.setStyleSheet("color:#9f9f9f;")
+        self.modifier_feedback.setStyleSheet(f"color:{INFO_COLOR};")
         modifier_layout.addWidget(self.modifier_feedback)
 
         modifier_buttons = QHBoxLayout()
@@ -1176,6 +1343,13 @@ class DemandPlanningWidget(QWidget):
 
         layout.addWidget(self.modifier_group)
         layout.addStretch(1)
+
+    def _heat_label_style(self, background: Optional[str] = None) -> str:
+        base_bg = background or "#10131b"
+        return (
+            f"border:1px solid #1f2331; border-radius:10px; padding:10px; "
+            f"background-color:{base_bg}; color:#f5f6fa; font-weight:600;"
+        )
 
     def set_active_week(self, active_week: Dict[str, Any]) -> None:
         self.active_week = active_week
@@ -1252,11 +1426,11 @@ class DemandPlanningWidget(QWidget):
     def _set_saved_state(self, saved: bool) -> None:
         if saved:
             self.save_status_label.setText("All changes saved")
-            self.save_status_label.setStyleSheet("color:#3cb371;")
+            self.save_status_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
             self._pending_changes = False
         else:
             self.save_status_label.setText("Unsaved changes")
-            self.save_status_label.setStyleSheet("color:#ffd166;")
+            self.save_status_label.setStyleSheet(f"color:{ACCENT_COLOR};")
             self._pending_changes = True
 
     def _mark_unsaved(self) -> None:
@@ -1352,9 +1526,7 @@ class DemandPlanningWidget(QWidget):
             else:
                 ratio = (adjusted - min_value) / (max_value - min_value)
             palette = self._heat_color(ratio, adjusted > 0 or base > 0)
-            label.setStyleSheet(
-                f"border:1px solid #334155; border-radius:6px; color:#e2e8f0; background-color:{palette};"
-            )
+            label.setStyleSheet(self._heat_label_style(palette))
             delta = adjusted - base
             label.setText(
                 f"{DAYS_OF_WEEK[day]}\n{self._format_currency(adjusted)}\n{self._format_delta(delta)}"
@@ -1482,7 +1654,7 @@ class DemandPlanningWidget(QWidget):
                 "pct_change": modifier.pct_change,
             },
         )
-        self.modifier_feedback.setStyleSheet("color:#3cb371;")
+        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.modifier_feedback.setText(f"Added modifier '{modifier.title}'.")
         self.refresh()
 
@@ -1525,7 +1697,7 @@ class DemandPlanningWidget(QWidget):
                 "pct_change": int(data["pct_change"]),
             },
         )
-        self.modifier_feedback.setStyleSheet("color:#3cb371;")
+        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.modifier_feedback.setText(f"Updated modifier '{data['title']}'.")
         self.refresh()
 
@@ -1555,7 +1727,7 @@ class DemandPlanningWidget(QWidget):
                 "title": current.title,
             },
         )
-        self.modifier_feedback.setStyleSheet("color:#ffd166;")
+        self.modifier_feedback.setStyleSheet(f"color:{ACCENT_COLOR};")
         self.modifier_feedback.setText(f"Deleted modifier '{current.title}'.")
         self.refresh()
 
@@ -1586,7 +1758,7 @@ class PolicyEditDialog(QDialog):
         layout.addLayout(form)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color:#ff6b6b;")
+        self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1643,7 +1815,7 @@ class PolicyDialog(QDialog):
         layout.addWidget(self.table)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color:#9f9f9f;")
+        self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
         layout.addWidget(self.feedback_label)
 
         buttons = QHBoxLayout()
@@ -1721,7 +1893,7 @@ class PolicyDialog(QDialog):
             role=self.current_user.get("role"),
             details={"policy_id": policy.id, "name": policy.name},
         )
-        self.feedback_label.setStyleSheet("color:#3cb371;")
+        self.feedback_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.feedback_label.setText(f"Added/updated policy '{policy.name}'.")
         self._load_policies()
 
@@ -1744,7 +1916,7 @@ class PolicyDialog(QDialog):
             role=self.current_user.get("role"),
             details={"policy_id": updated.id, "name": updated.name},
         )
-        self.feedback_label.setStyleSheet("color:#3cb371;")
+        self.feedback_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.feedback_label.setText(f"Updated policy '{updated.name}'.")
         self._load_policies()
 
@@ -1769,7 +1941,7 @@ class PolicyDialog(QDialog):
             role=self.current_user.get("role"),
             details={"policy_id": policy.id, "name": policy.name},
         )
-        self.feedback_label.setStyleSheet("color:#ffd166;")
+        self.feedback_label.setStyleSheet(f"color:{ACCENT_COLOR};")
         self.feedback_label.setText(f"Deleted policy '{policy.name}'.")
         self._load_policies()
 
@@ -1882,7 +2054,7 @@ class EmployeeEditDialog(QDialog):
         layout.addLayout(form)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color: #ff6b6b;")
+        self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2074,7 +2246,7 @@ class UnavailabilityEntryDialog(QDialog):
         layout.addLayout(form)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color: #ff6b6b;")
+        self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2475,7 +2647,7 @@ class ChangePasswordDialog(QDialog):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         heading = QLabel(
-            f"<b>Update password for <span style='color:#b8860b;'>{self.username}</span></b>"
+            f"<b>Update password for <span style='color:{ACCENT_COLOR};'>{self.username}</span></b>"
         )
         heading.setWordWrap(True)
         layout.addWidget(heading)
@@ -2497,7 +2669,7 @@ class ChangePasswordDialog(QDialog):
         form.addRow("Confirm password", self.confirm_input)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setStyleSheet("color: #ff6b6b;")
+        self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         self.feedback_label.setWordWrap(True)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2560,9 +2732,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setAlignment(Qt.AlignTop)
         display_name = self.user.get("display_name", self.user["username"])
-        welcome = QLabel(f"<h1 style='color:#b8860b;'>Welcome, {display_name}!</h1>")
+        welcome = QLabel(f"<h1 style='color:#f5b942;'>Welcome, {display_name}!</h1>")
         role_label = QLabel(f"Current role: <b>{self.user['role']}</b>")
-        role_label.setStyleSheet("color:#ddd;")
+        role_label.setStyleSheet("color:#c9cede;")
         intro = QLabel(
             "Use the demand planning workspace below to capture projected sales and highlight high-impact days "
             "before the scheduling pass."
@@ -2761,6 +2933,9 @@ class MainWindow(QMainWindow):
 
 def launch_app() -> int:
     app = QApplication(sys.argv)
+    icon = QIcon(str(ICON_FILE)) if ICON_FILE.exists() else None
+    if icon is not None:
+        app.setWindowIcon(icon)
     app.setStyleSheet(THEME_STYLESHEET)
 
     store = AccountStore(ACCOUNTS_FILE)
@@ -2779,6 +2954,8 @@ def launch_app() -> int:
 
         window = MainWindow(store, authenticated, SessionLocal)
         window.setStyleSheet(THEME_STYLESHEET)
+        if icon is not None:
+            window.setWindowIcon(icon)
         window.show()
         app.exec()
 
