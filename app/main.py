@@ -8,7 +8,7 @@ import json
 import secrets
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy import select
 
@@ -17,14 +17,18 @@ from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -35,6 +39,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTimeEdit,
@@ -49,19 +54,40 @@ from database import (
     Modifier,
     Policy,
     SessionLocal,
+    WeekContext,
     WeekDailyProjection,
     get_all_employees,
     get_all_weeks,
-    get_or_create_week,
+    get_or_create_week_context,
+    get_shifts_for_week,
     get_week_daily_projections,
     get_week_modifiers,
+    get_week_summary,
     get_policies,
     upsert_policy,
     delete_policy,
     get_active_policy,
+    set_week_status,
     init_database,
     save_week_daily_projection_values,
 )
+
+from exporter import DATA_DIR as EXPORT_DIR, export_week
+from data_exchange import (
+    copy_week_dataset,
+    export_employees,
+    export_week_modifiers,
+    export_week_projections,
+    export_week_schedule,
+    get_weeks_summary,
+    import_employees,
+    import_week_modifiers,
+    import_week_projections,
+    import_week_schedule,
+)
+from policy_defaults import ensure_default_policy
+from roles import ROLE_GROUPS
+from ui.week_view import WeekSchedulePage
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -84,6 +110,8 @@ WARNING_COLOR = "#f5b942"
 INFO_COLOR = "#a8aec6"
 ERROR_COLOR = "#ff7a7a"
 
+WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+ROLE_CATALOG = sorted({role for group in ROLE_GROUPS.values() for role in group})
 
 def week_start_date(iso_year: int, iso_week: int) -> datetime.date:
     return datetime.date.fromisocalendar(iso_year, iso_week, 1)
@@ -121,7 +149,7 @@ def load_active_week(session_factory) -> Dict[str, Any]:
         iso_year, iso_week, _ = today.isocalendar()
     label = week_label(iso_year, iso_week)
     with session_factory() as session:
-        week = get_or_create_week(session, iso_year, iso_week, label)
+        week = get_or_create_week_context(session, iso_year, iso_week, label)
         label = week.label
     save_active_week(iso_year, iso_week)
     return {"iso_year": iso_year, "iso_week": iso_week, "label": label}
@@ -139,10 +167,6 @@ def format_time_label(value: datetime.time) -> str:
     suffix = "AM" if value.hour < 12 else "PM"
     return f"{hour}:{value.minute:02d} {suffix}"
 EMPLOYEE_ROLE_GROUPS = {
-    "Managers": [
-        "Manager FOH",
-        "Manager HOH",
-    ],
     "Bartenders": [
         "Bartender",
         "Bartender - Opener",
@@ -186,7 +210,7 @@ DAYS_OF_WEEK = [
 ]
 THEME_STYLESHEET = """
 QWidget {
-    background-color: #0c0d13;
+    background-color: #090a0e;
     color: #f5f6fa;
     font-family: 'Segoe UI', sans-serif;
     font-size: 15px;
@@ -197,8 +221,8 @@ QLabel {
 }
 
 QFrame, QGroupBox, QDialog, QMenu, QToolTip {
-    background-color: #141722;
-    border: 1px solid #1f2331;
+    background-color: #111217;
+    border: 1px solid #1c1d23;
     border-radius: 12px;
 }
 
@@ -214,13 +238,13 @@ QGroupBox::title {
     subcontrol-position: top left;
     margin-left: 14px;
     padding: 2px 10px;
-    background-color: #141722;
+    background-color: #111217;
     border-radius: 8px;
 }
 
 QPushButton {
     background-color: #f5b942;
-    color: #0d0e13;
+    color: #0b0b0f;
     border-radius: 10px;
     padding: 10px 22px;
     font-weight: 600;
@@ -237,8 +261,8 @@ QPushButton:pressed {
 }
 
 QPushButton:disabled {
-    background-color: #2a2e3a;
-    color: #74788d;
+    background-color: #262730;
+    color: #7d7f8f;
 }
 
 QLineEdit,
@@ -247,21 +271,21 @@ QSpinBox,
 QDateEdit,
 QTimeEdit,
 QPlainTextEdit {
-    background-color: #191c29;
-    border: 1px solid #262a38;
+    background-color: #15161c;
+    border: 1px solid #25262d;
     border-radius: 10px;
     padding: 8px 14px;
     color: #f5f6fa;
     selection-background-color: #f5b942;
-    selection-color: #0d0e13;
+    selection-color: #0b0b0f;
 }
 
 QLineEdit::placeholder {
-    color: #9aa0b5;
+    color: #9ea2b2;
 }
 
 QComboBox QAbstractItemView::item {
-    color: #9aa0b5;
+    color: #d7d9e4;
 }
 
 QLineEdit:focus,
@@ -274,10 +298,10 @@ QPlainTextEdit:focus {
 }
 
 QComboBox QAbstractItemView {
-    background-color: #11131a;
-    border: 1px solid #262a38;
+    background-color: #0e0f13;
+    border: 1px solid #25262d;
     selection-background-color: #f5b942;
-    selection-color: #0d0e13;
+    selection-color: #0b0b0f;
     color: #f5f6fa;
 }
 
@@ -286,9 +310,9 @@ QPlainTextEdit {
 }
 
 QTabWidget::pane {
-    border: 1px solid #1f2331;
+    border: 1px solid #1b1c22;
     border-radius: 10px;
-    background: #0c0d13;
+    background: #070708;
 }
 
 QTabWidget::tab-bar {
@@ -296,34 +320,35 @@ QTabWidget::tab-bar {
 }
 
 QTabBar::tab {
-    background: #0c0d13;
+    background: #0d0d11;
     color: #f5f6fa;
     padding: 8px 18px;
     margin-right: 2px;
-    border: 1px solid #1f2331;
+    border: 1px solid #1b1c22;
     border-bottom: none;
     border-top-left-radius: 10px;
     border-top-right-radius: 10px;
 }
 
 QTabBar::tab:selected {
-    background: #141722;
+    background: #16171d;
     color: #f9d24a;
+    border-color: #2b2c33;
 }
 
 QTabBar::tab:hover {
-    background: #181b26;
+    background: #1a1b21;
 }
 
 QTableWidget,
 QTableView {
-    background-color: #131620;
-    alternate-background-color: #1a1e2c;
-    border: 1px solid #1f2331;
+    background-color: #14151c;
+    alternate-background-color: #1b1c24;
+    border: 1px solid #1c1d23;
     border-radius: 12px;
-    gridline-color: #262a38;
+    gridline-color: #26272f;
     selection-background-color: #f5b942;
-    selection-color: #0d0e13;
+    selection-color: #0b0b0f;
 }
 
 QTableWidget::item,
@@ -332,7 +357,7 @@ QTableView::item {
 }
 
 QHeaderView::section {
-    background-color: #0f1119;
+    background-color: #0d0e13;
     color: #f5f6fa;
     padding: 9px 14px;
     border: none;
@@ -342,18 +367,18 @@ QHeaderView::section {
 }
 
 QTableCornerButton::section {
-    background-color: #0f1119;
+    background-color: #0d0e13;
     border: none;
 }
 
 QListWidget,
 QListView,
 QTreeView {
-    background-color: #131620;
-    border: 1px solid #1f2331;
+    background-color: #14151c;
+    border: 1px solid #1c1d23;
     border-radius: 12px;
     selection-background-color: #f5b942;
-    selection-color: #0d0e13;
+    selection-color: #0b0b0f;
 }
 
 QListWidget::item,
@@ -381,12 +406,12 @@ QScrollBar:horizontal {
 }
 
 QScrollBar::handle {
-    background: #2e3343;
+    background: #2e2f37;
     border-radius: 6px;
 }
 
 QScrollBar::handle:hover {
-    background: #3a4053;
+    background: #3a3b45;
 }
 
 QScrollBar::add-line,
@@ -760,6 +785,7 @@ class LoginDialog(QDialog):
         self.error_label = QLabel()
         self.error_label.setStyleSheet(f"color:{ERROR_COLOR};")
         self.error_label.setWordWrap(True)
+        self.error_label.setVisible(False)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.attempt_login)
@@ -772,6 +798,10 @@ class LoginDialog(QDialog):
         layout.addWidget(self.error_label)
         layout.addWidget(button_box)
 
+    def _set_error(self, message: str = "") -> None:
+        self.error_label.setText(message)
+        self.error_label.setVisible(bool(message.strip()))
+
     def attempt_login(self) -> None:
         username = self.username_input.text().strip()
         password = self.password_input.text()
@@ -781,7 +811,7 @@ class LoginDialog(QDialog):
             self.password_input.clear()
             locked_local = exc.until.astimezone()
             message = locked_local.strftime("Account locked until %Y-%m-%d %H:%M %Z.")
-            self.error_label.setText(message)
+            self._set_error(message)
             audit_logger.log(
                 "login_failure",
                 username,
@@ -795,7 +825,7 @@ class LoginDialog(QDialog):
         self.password_input.clear()
 
         if not account:
-            self.error_label.setText("Invalid username or password.")
+            self._set_error("Invalid username or password.")
             audit_logger.log(
                 "login_failure",
                 username,
@@ -803,7 +833,7 @@ class LoginDialog(QDialog):
             )
             return
 
-        self.error_label.setText("")
+        self._set_error("")
         self.username_input.setText(account["username"])
         audit_logger.log(
             "login_success",
@@ -993,7 +1023,7 @@ class WeekSelectorWidget(QWidget):
         with self.session_factory() as session:
             weeks = get_all_weeks(session)
             if not weeks:
-                week = get_or_create_week(
+                week = get_or_create_week_context(
                     session,
                     active_week["iso_year"],
                     active_week["iso_week"],
@@ -1037,11 +1067,440 @@ class WeekSelectorWidget(QWidget):
         iso_year, iso_week, _ = selected_date.isocalendar()
         label = week_label(iso_year, iso_week)
         with self.session_factory() as session:
-            week = get_or_create_week(session, iso_year, iso_week, label)
+            week = get_or_create_week_context(session, iso_year, iso_week, label)
             label = week.label
         self.set_active_week({"iso_year": iso_year, "iso_week": iso_week, "label": label})
         if self.on_change:
             self.on_change(iso_year, iso_week, label)
+
+
+class ValidationImportExportPage(QWidget):
+    def __init__(
+        self,
+        session_factory,
+        user: Dict[str, Any],
+        active_week: Dict[str, Any],
+        *,
+        on_week_changed: Optional[Callable[[int, int, str], None]] = None,
+        on_status_updated: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        super().__init__()
+        self.session_factory = session_factory
+        self.user = user
+        self.active_week = active_week
+        self.on_week_changed = on_week_changed
+        self.on_status_updated = on_status_updated
+        self.summary_data: Dict[str, Any] = {}
+        self.week_selector: Optional[WeekSelectorWidget] = None
+        self._build_ui()
+        self.set_active_week(active_week)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        intro = QLabel("Validate coverage, confirm readiness, and export approved schedules.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.week_selector = WeekSelectorWidget(self.session_factory, self.active_week, self._handle_week_change)
+        layout.addWidget(self.week_selector)
+
+        summary_box = QGroupBox("Week snapshot")
+        summary_layout = QFormLayout(summary_box)
+        self.status_badge = QLabel("--")
+        self.status_badge.setStyleSheet("font-weight:600;")
+        self.shift_label = QLabel("0 shifts")
+        self.cost_label = QLabel("$0.00")
+        summary_layout.addRow("Status", self.status_badge)
+        summary_layout.addRow("Scheduled shifts", self.shift_label)
+        summary_layout.addRow("Projected labor", self.cost_label)
+        layout.addWidget(summary_box)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setWordWrap(True)
+        layout.addWidget(self.feedback_label)
+
+        self.results_list = QListWidget()
+        self.results_list.setAlternatingRowColors(True)
+        layout.addWidget(self.results_list)
+
+        exchange_box = QGroupBox("Import / Export")
+        exchange_layout = QVBoxLayout(exchange_box)
+
+        self.dataset_combo = QComboBox()
+        self.dataset_combo.addItem("Employee directory", "employees")
+        self.dataset_combo.addItem("Week projections", "projections")
+        self.dataset_combo.addItem("Week modifiers", "modifiers")
+        self.dataset_combo.addItem("Week schedule", "shifts")
+        self.dataset_combo.currentIndexChanged.connect(self._update_button_states)
+
+        dataset_form = QFormLayout()
+        dataset_form.addRow("Dataset", self.dataset_combo)
+        exchange_layout.addLayout(dataset_form)
+
+        dataset_buttons = QHBoxLayout()
+        dataset_buttons.setSpacing(10)
+        self.export_dataset_button = QPushButton("Export file")
+        self.export_dataset_button.clicked.connect(self._handle_dataset_export)
+        dataset_buttons.addWidget(self.export_dataset_button)
+        self.import_dataset_button = QPushButton("Import file")
+        self.import_dataset_button.clicked.connect(self._handle_dataset_import)
+        dataset_buttons.addWidget(self.import_dataset_button)
+        dataset_buttons.addStretch()
+        exchange_layout.addLayout(dataset_buttons)
+
+        self.copy_week_button = QPushButton("Copy dataset from another week")
+        self.copy_week_button.clicked.connect(self._handle_copy_from_week)
+        exchange_layout.addWidget(self.copy_week_button)
+
+        layout.addWidget(exchange_box)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        self.validate_button = QPushButton("Run validation")
+        self.validate_button.clicked.connect(self._run_validation)
+        controls.addWidget(self.validate_button)
+
+        self.export_format = QComboBox()
+        self.export_format.addItem("PDF", "pdf")
+        self.export_format.addItem("CSV", "csv")
+        controls.addWidget(self.export_format)
+
+        self.export_button = QPushButton("Generate export")
+        self.export_button.clicked.connect(self._handle_export)
+        controls.addWidget(self.export_button)
+
+        self.mark_exported_button = QPushButton("Mark exported")
+        self.mark_exported_button.clicked.connect(lambda: self._finalize_export(manual=True))
+        controls.addWidget(self.mark_exported_button)
+
+        controls.addStretch()
+        layout.addLayout(controls)
+        layout.addStretch(1)
+        self._update_button_states()
+
+    def set_active_week(self, active_week: Dict[str, Any]) -> None:
+        if not active_week:
+            return
+        self.active_week = active_week
+        if self.week_selector:
+            self.week_selector.set_active_week(active_week)
+        self._refresh_summary()
+
+    def _current_week_start(self) -> Optional[datetime.date]:
+        if not self.active_week:
+            return None
+        return week_start_date(self.active_week["iso_year"], self.active_week["iso_week"])
+
+    def _refresh_summary(self) -> None:
+        week_start = self._current_week_start()
+        if not week_start:
+            return
+        with self.session_factory() as session:
+            self.summary_data = get_week_summary(session, week_start)
+        status = (self.summary_data.get("status") or "draft").strip().lower()
+        self.status_badge.setText(status.title())
+        badge_color = {
+            "draft": WARNING_COLOR,
+            "validated": SUCCESS_COLOR,
+            "exported": ACCENT_COLOR,
+        }.get(status, INFO_COLOR)
+        self.status_badge.setStyleSheet(f"font-weight:600; color:{badge_color};")
+        self.shift_label.setText(f"{self.summary_data.get('total_shifts', 0)} shifts")
+        self.cost_label.setText(f"${self.summary_data.get('total_cost', 0.0):.2f}")
+        self._update_button_states()
+
+    def _update_button_states(self) -> None:
+        status = (self.summary_data.get("status") or "draft").lower()
+        has_week = bool(self.summary_data.get("week_id"))
+        can_export = status in {"validated", "exported"} and has_week
+        self.export_button.setEnabled(can_export)
+        self.mark_exported_button.setEnabled(status == "validated" and has_week)
+        dataset = self.dataset_combo.currentData() if hasattr(self, "dataset_combo") else None
+        requires_week = self._dataset_requires_week(dataset)
+        allow_dataset = has_week or not requires_week
+        if hasattr(self, "export_dataset_button"):
+            self.export_dataset_button.setEnabled(bool(dataset) and allow_dataset)
+        if hasattr(self, "import_dataset_button"):
+            self.import_dataset_button.setEnabled(bool(dataset) and allow_dataset)
+        if hasattr(self, "copy_week_button"):
+            self.copy_week_button.setEnabled(bool(dataset) and dataset != "employees" and has_week)
+
+    def _handle_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
+        self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
+        self._refresh_summary()
+        if self.on_week_changed:
+            self.on_week_changed(iso_year, iso_week, label)
+
+    def _run_validation(self) -> None:
+        self.results_list.clear()
+        week_start = self._current_week_start()
+        if not week_start:
+            self._set_feedback("Select a week to validate.", WARNING_COLOR)
+            return
+        with self.session_factory() as session:
+            summary = get_week_summary(session, week_start)
+            shifts = get_shifts_for_week(session, week_start)
+        errors: List[str] = []
+        if summary.get("total_shifts", 0) == 0:
+            errors.append("No shifts scheduled for the selected week.")
+        for day in summary.get("days", []):
+            if day.get("count", 0) == 0:
+                errors.append(f"No coverage scheduled for {day.get('date')}.")
+        for shift in shifts:
+            if not shift.get("employee_id"):
+                start = shift.get("start")
+                label = self._format_shift_label(start)
+                errors.append(f"{shift.get('role')} shift starting {label} is unassigned.")
+        if errors:
+            for message in errors:
+                self.results_list.addItem(f"Error: {message}")
+            self._set_feedback("Validation failed. Resolve the errors highlighted above.", ERROR_COLOR)
+            self._refresh_summary()
+            return
+        self.results_list.addItem("Validation complete. Week is ready for export.")
+        self._set_feedback("All checks passed. Week marked as validated.", SUCCESS_COLOR)
+        self._apply_week_status("validated")
+        audit_logger.log(
+            "week_validated",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={
+                "iso_year": self.active_week.get("iso_year"),
+                "iso_week": self.active_week.get("iso_week"),
+            },
+        )
+
+    def _handle_export(self) -> None:
+        status = (self.summary_data.get("status") or "draft").lower()
+        if status not in {"validated", "exported"}:
+            self._set_feedback("Run validation before exporting the schedule.", WARNING_COLOR)
+            return
+        week_id = self.summary_data.get("week_id")
+        if not week_id:
+            self._set_feedback("No schedule data found for the selected week.", ERROR_COLOR)
+            return
+        fmt = self.export_format.currentData() or "pdf"
+        export_path = export_week(week_id, fmt)
+        self._finalize_export(manual=False)
+        audit_logger.log(
+            "week_export",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={
+                "week_id": week_id,
+                "format": fmt,
+                "path": str(export_path),
+            },
+        )
+        QMessageBox.information(
+            self,
+            "Export complete",
+            f"Schedule exported to {export_path}",
+        )
+        self.results_list.addItem(f"Exported validated week to {export_path}")
+
+    def _handle_dataset_export(self) -> None:
+        dataset = self.dataset_combo.currentData()
+        if not dataset:
+            return
+        try:
+            path = self._export_dataset(dataset)
+        except Exception as exc:
+            self._set_feedback(f"Export failed: {exc}", ERROR_COLOR)
+            return
+        if not path:
+            return
+        self._set_feedback(f"Saved {dataset} export to {path}", SUCCESS_COLOR)
+        self.results_list.addItem(f"Exported {dataset} -> {path}")
+        audit_logger.log(
+            "data_export",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={"dataset": dataset, "path": str(path)},
+        )
+
+    def _handle_dataset_import(self) -> None:
+        dataset = self.dataset_combo.currentData()
+        if not dataset:
+            return
+        if self._dataset_requires_week(dataset) and not self._current_week_start():
+            self._set_feedback("Select a week before importing this dataset.", WARNING_COLOR)
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select data file",
+            str(EXPORT_DIR),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        try:
+            summary = self._import_dataset(dataset, path)
+        except Exception as exc:
+            self._set_feedback(f"Import failed: {exc}", ERROR_COLOR)
+            return
+        recap = ", ".join(f"{k}={v}" for k, v in summary.items())
+        self._set_feedback(f"Imported {dataset} ({recap}).", SUCCESS_COLOR)
+        self.results_list.addItem(f"Imported {dataset} from {path} ({recap})")
+        if dataset != "employees":
+            self._notify_week_mutation()
+        audit_logger.log(
+            "data_import",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={"dataset": dataset, "path": str(path), "summary": summary},
+        )
+
+    def _handle_copy_from_week(self) -> None:
+        dataset = self.dataset_combo.currentData()
+        if not dataset or dataset == "employees":
+            self._set_feedback("Copying is available for week-based datasets only.", INFO_COLOR)
+            return
+        if not self._current_week_start():
+            self._set_feedback("Select a destination week first.", WARNING_COLOR)
+            return
+        with self.session_factory() as session:
+            weeks = [entry for entry in get_weeks_summary(session)]
+            current_label = self.active_week.get("label") if self.active_week else None
+            options = [entry["label"] for entry in weeks if entry["label"] != current_label]
+            if not options:
+                self._set_feedback("No other weeks are available to copy from.", INFO_COLOR)
+                return
+            selection, ok = QInputDialog.getItem(
+                self,
+                "Copy data",
+                "Copy from week",
+                options,
+                editable=False,
+            )
+            if not ok or not selection:
+                return
+            source_meta = next((entry for entry in weeks if entry["label"] == selection), None)
+            if not source_meta:
+                return
+            source_week = session.get(WeekContext, source_meta["id"])
+            target_week = self._get_week_context(session)
+            if not source_week or not target_week:
+                self._set_feedback("Unable to resolve the requested weeks.", ERROR_COLOR)
+                return
+            summary = copy_week_dataset(
+                session,
+                source_week,
+                target_week,
+                dataset,
+                actor=self.user.get("username", "unknown"),
+            )
+        recap = ", ".join(f"{k}={v}" for k, v in summary.items())
+        self._set_feedback(f"Copied {dataset} from {selection} ({recap}).", SUCCESS_COLOR)
+        self.results_list.addItem(f"Copied {dataset} from {selection} -> {self.active_week.get('label')}")
+        self._notify_week_mutation()
+        audit_logger.log(
+            "week_copy",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={
+                "dataset": dataset,
+                "source_week": selection,
+                "target_week": self.active_week.get("label") if self.active_week else None,
+                "summary": summary,
+            },
+        )
+
+    def _finalize_export(self, manual: bool) -> None:
+        self._apply_week_status("exported")
+        if manual:
+            audit_logger.log(
+                "week_mark_exported",
+                self.user.get("username", "unknown"),
+                role=self.user.get("role"),
+                details={
+                    "iso_year": self.active_week.get("iso_year"),
+                    "iso_week": self.active_week.get("iso_week"),
+                },
+            )
+        self._set_feedback("Week marked as exported.", ACCENT_COLOR)
+
+    def _apply_week_status(self, status: str) -> None:
+        week_start = self._current_week_start()
+        if not week_start:
+            return
+        with self.session_factory() as session:
+            set_week_status(session, week_start, status)
+        self._refresh_summary()
+        if self.on_status_updated:
+            self.on_status_updated(status)
+
+    def _format_shift_label(self, start: Optional[datetime.datetime]) -> str:
+        if not isinstance(start, datetime.datetime):
+            return "an unknown time"
+        localized = start.astimezone()
+        return localized.strftime("%a %m/%d %I:%M %p")
+
+    def _set_feedback(self, message: str, color: str = INFO_COLOR) -> None:
+        self.feedback_label.setStyleSheet(f"color:{color};")
+        self.feedback_label.setText(message)
+        self.feedback_label.repaint()
+
+    def _export_dataset(self, dataset: str) -> Optional[Path]:
+        with self.session_factory() as session:
+            if dataset == "employees":
+                return export_employees(session)
+            week = self._get_week_context(session)
+            if not week:
+                raise ValueError("Select a week first.")
+            if dataset == "projections":
+                return export_week_projections(session, week)
+            if dataset == "modifiers":
+                return export_week_modifiers(session, week)
+            if dataset == "shifts":
+                week_start = self._current_week_start()
+                if not week_start:
+                    raise ValueError("Select a week first.")
+                return export_week_schedule(session, week_start)
+        return None
+
+    def _import_dataset(self, dataset: str, path: Path) -> Dict[str, int]:
+        with self.session_factory() as session:
+            if dataset == "employees":
+                created, updated = import_employees(session, path)
+                return {"created": created, "updated": updated}
+            week = self._get_week_context(session)
+            if not week:
+                raise ValueError("Select a week first.")
+            if dataset == "projections":
+                count = import_week_projections(session, week, path)
+                return {"projections": count}
+            if dataset == "modifiers":
+                count = import_week_modifiers(session, week, path, created_by=self.user.get("username", "unknown"))
+                return {"modifiers": count}
+            if dataset == "shifts":
+                week_start = self._current_week_start()
+                if not week_start:
+                    raise ValueError("Select a week first.")
+                count = import_week_schedule(session, week_start, path)
+                return {"shifts": count}
+        raise ValueError(f"Unsupported dataset '{dataset}'")
+
+    def _dataset_requires_week(self, dataset: Optional[str]) -> bool:
+        return dataset in {"projections", "modifiers", "shifts"}
+
+    def _get_week_context(self, session):
+        if not self.active_week:
+            return None
+        iso_year = self.active_week.get("iso_year")
+        iso_week = self.active_week.get("iso_week")
+        label = self.active_week.get("label", f"{iso_year} W{iso_week}")
+        if iso_year is None or iso_week is None:
+            return None
+        return get_or_create_week_context(session, iso_year, iso_week, label)
+
+    def _notify_week_mutation(self) -> None:
+        self._refresh_summary()
+        if self.on_status_updated:
+            self.on_status_updated("draft")
 
 
 class ModifierDialog(QDialog):
@@ -1222,7 +1681,7 @@ class DemandPlanningWidget(QWidget):
         self.heat_labels: Dict[int, QLabel] = {}
         self._pending_changes = False
         self._modifier_column_ratios: Dict[int, float] = {
-            0: 0.20,  # Title
+            0: 0.28,  # Title
             1: 0.12,  # Impact
             2: 0.12,  # Day
             3: 0.18,  # Window
@@ -1267,13 +1726,23 @@ class DemandPlanningWidget(QWidget):
 
         projection_layout.addLayout(grid)
 
-        buttons_row = QHBoxLayout()
+        status_row = QHBoxLayout()
+        self.completion_badge = QLabel()
+        self.completion_badge.setObjectName("completionBadge")
+        self.completion_badge.setStyleSheet(
+            "padding:4px 10px; border-radius:8px; background-color:#141722; font-weight:600;"
+        )
+        status_row.addWidget(self.completion_badge)
+        status_row.addStretch()
         self.save_status_label = QLabel()
-        buttons_row.addWidget(self.save_status_label)
-        buttons_row.addStretch()
+        status_row.addWidget(self.save_status_label)
+        projection_layout.addLayout(status_row)
+
+        buttons_row = QHBoxLayout()
         self.save_button = QPushButton("Save daily projections")
         self.save_button.clicked.connect(self.handle_save_projections)
         buttons_row.addWidget(self.save_button)
+        buttons_row.addStretch()
         projection_layout.addLayout(buttons_row)
         self._set_saved_state(True)
 
@@ -1292,8 +1761,8 @@ class DemandPlanningWidget(QWidget):
         for day_index, day_name in enumerate(DAYS_OF_WEEK):
             label = QLabel(day_name)
             label.setAlignment(Qt.AlignCenter)
-            label.setMinimumWidth(100)
-            label.setFixedHeight(72)
+            label.setMinimumWidth(110)
+            label.setFixedHeight(96)
             label.setWordWrap(True)
             label.setStyleSheet(self._heat_label_style())
             self.heat_labels[day_index] = label
@@ -1313,14 +1782,21 @@ class DemandPlanningWidget(QWidget):
         self.modifier_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.modifier_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.modifier_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.modifier_table.setWordWrap(True)
+        self.modifier_table.setTextElideMode(Qt.ElideNone)
         header = self.modifier_table.horizontalHeader()
-        header.setStretchLastSection(False)
         header.setMinimumSectionSize(80)
-        for column in range(self.modifier_table.columnCount()):
-            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        for column in range(1, 6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.modifier_table.verticalHeader().setDefaultSectionSize(40)
         self.modifier_table.itemSelectionChanged.connect(self._update_modifier_buttons)
         modifier_layout.addWidget(self.modifier_table)
         self._apply_modifier_column_layout()
+        self._update_completion_status()
 
         self.modifier_feedback = QLabel()
         self.modifier_feedback.setStyleSheet(f"color:{INFO_COLOR};")
@@ -1361,7 +1837,7 @@ class DemandPlanningWidget(QWidget):
         iso_week = self.active_week.get("iso_week")
         label = self.active_week.get("label") or ""
         with self.session_factory() as session:
-            week = get_or_create_week(session, iso_year, iso_week, label)
+            week = get_or_create_week_context(session, iso_year, iso_week, label)
             self.week_id = week.id
             self.week_label = week.label
             self.projections = get_week_daily_projections(session, week.id)
@@ -1371,12 +1847,31 @@ class DemandPlanningWidget(QWidget):
         self._apply_heatmap()
         self._update_group_titles()
         self._update_modifier_buttons()
+        self._update_completion_status()
 
     def _update_group_titles(self) -> None:
-        suffix = f" – {self.week_label}" if self.week_label else ""
+        suffix = f" - {self.week_label}" if self.week_label else ""
         self.projection_group.setTitle(f"Projected sales by day{suffix}")
         self.modifier_group.setTitle(f"Modifiers{suffix}")
         self.heat_group.setTitle(f"Sales heat map{suffix}")
+
+    def _update_completion_status(self) -> None:
+        if not hasattr(self, "completion_badge"):
+            return
+        all_days_filled = all(field.text().strip() for field in self.day_inputs.values())
+        if not all_days_filled:
+            status = "Incomplete"
+            color = ERROR_COLOR
+        elif self.modifiers:
+            status = "Complete with Modifiers"
+            color = SUCCESS_COLOR
+        else:
+            status = "Complete"
+            color = WARNING_COLOR
+        self.completion_badge.setText(f"Status: {status}")
+        self.completion_badge.setStyleSheet(
+            f"padding:4px 10px; border-radius:8px; background-color:#1b1f2d; color:{color}; font-weight:600;"
+        )
 
     def _apply_modifier_column_layout(self) -> None:
         if not hasattr(self, "modifier_table"):
@@ -1422,6 +1917,7 @@ class DemandPlanningWidget(QWidget):
 
     def _handle_projection_field_edited(self, _text: str) -> None:
         self._mark_unsaved()
+        self._update_completion_status()
 
     def _set_saved_state(self, saved: bool) -> None:
         if saved:
@@ -1589,7 +2085,7 @@ class DemandPlanningWidget(QWidget):
             type_label = "Increase" if modifier.pct_change >= 0 else "Decrease"
             change_text = f"{modifier.pct_change:+d}%"
             day_text = DAYS_OF_WEEK[modifier.day_of_week]
-            window_text = f"{format_time_label(modifier.start_time)} – {format_time_label(modifier.end_time)}"
+            window_text = f"{format_time_label(modifier.start_time)} - {format_time_label(modifier.end_time)}"
             notes_text = modifier.notes or ""
 
             title_item = QTableWidgetItem(modifier.title)
@@ -1603,6 +2099,7 @@ class DemandPlanningWidget(QWidget):
             self.modifier_table.setItem(row, 6, QTableWidgetItem(notes_text))
 
         self._apply_modifier_column_layout()
+        self._update_completion_status()
 
     def _selected_modifier(self) -> Optional[Modifier]:
         selection = self.modifier_table.selectionModel()
@@ -1736,51 +2233,636 @@ class DemandPlanningWidget(QWidget):
         self._apply_modifier_column_layout()
 
 
-class PolicyEditDialog(QDialog):
+def _default_timeblocks() -> List[Dict[str, str]]:
+    return [
+        {"name": "Open", "start": "10:00", "end": "14:00"},
+        {"name": "Mid", "start": "12:00", "end": "17:00"},
+        {"name": "PM", "start": "16:00", "end": "21:00"},
+        {"name": "Close", "start": "20:00", "end": "24:00"},
+    ]
+
+
+def _timeblocks_from_params(params: Dict[str, Any]) -> List[Dict[str, str]]:
+    blocks = params.get("timeblocks") if isinstance(params, dict) else None
+    if not isinstance(blocks, dict) or not blocks:
+        return _default_timeblocks()
+    rows: List[Dict[str, str]] = []
+    for name, spec in blocks.items():
+        if not isinstance(spec, dict):
+            continue
+        rows.append(
+            {
+                "name": name,
+                "start": spec.get("start", "10:00"),
+                "end": spec.get("end", "14:00"),
+            }
+        )
+    return rows or _default_timeblocks()
+
+
+def _default_role_payload(block_names: List[str]) -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "priority": 1.0,
+        "max_weekly_hours": 35,
+        "daily_boost": {},
+        "thresholds": [],
+        "blocks": {
+            block: {"base": 0, "min": 0, "max": 0, "per_1000_sales": 0.0, "per_modifier": 0.0}
+            for block in block_names
+        },
+    }
+
+
+def _default_business_hours() -> Dict[str, Dict[str, str]]:
+    return {
+        "Mon": {"open": "11:00", "close": "24:00"},
+        "Tue": {"open": "11:00", "close": "24:00"},
+        "Wed": {"open": "11:00", "close": "24:00"},
+        "Thu": {"open": "11:00", "close": "24:00"},
+        "Fri": {"open": "11:00", "close": "25:00"},
+        "Sat": {"open": "11:00", "close": "25:00"},
+        "Sun": {"open": "11:00", "close": "23:00"},
+    }
+
+
+class PolicyComposerDialog(QDialog):
     def __init__(self, *, name: str = "", params: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
         self.setWindowTitle("Edit policy" if name else "Add policy")
+        self.resize(1100, 720)
         self.result_data: Optional[Dict[str, Any]] = None
+        self.policy_payload = self._initial_policy(params or {})
+        self.role_models = self.policy_payload["roles"]
+        self.current_role: Optional[str] = None
+
         layout = QVBoxLayout(self)
+        self.name_input = QLineEdit(name or self.policy_payload.get("name", "Default Policy"))
+        name_form = QFormLayout()
+        self.description_input = QLineEdit(self.policy_payload.get("description", ""))
+        name_form.addRow("Name", self.name_input)
+        name_form.addRow("Description", self.description_input)
+        layout.addLayout(name_form)
 
-        form = QFormLayout()
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("e.g. Default Policy")
-        if name:
-            self.name_input.setText(name)
-        form.addRow("Name", self.name_input)
-
-        self.json_edit = QPlainTextEdit()
-        self.json_edit.setPlaceholderText("{\"rule_key\": value, ...}")
-        pretty = json.dumps(params or {}, indent=2)
-        self.json_edit.setPlainText(pretty)
-        form.addRow("Parameters (JSON)", self.json_edit)
-        layout.addLayout(form)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_global_tab(), "Global rules")
+        self.tabs.addTab(self._build_timeblocks_tab(), "Time blocks")
+        self.tabs.addTab(self._build_roles_tab(), "Role coverage")
+        layout.addWidget(self.tabs)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        if ROLE_CATALOG:
+            self.role_list.setCurrentRow(0)
+
+    def _initial_policy(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        timeblocks = _timeblocks_from_params(params)
+        block_names = [row["name"] for row in timeblocks]
+        roles_payload: Dict[str, Any] = {}
+        existing_roles = params.get("roles") if isinstance(params, dict) else {}
+        if not isinstance(existing_roles, dict):
+            existing_roles = {}
+        for role in ROLE_CATALOG:
+            raw = existing_roles.get(role)
+            if isinstance(raw, dict):
+                payload = raw.copy()
+            else:
+                payload = {}
+            payload.setdefault("enabled", False)
+            payload.setdefault("priority", 1.0)
+            payload.setdefault("max_weekly_hours", 35)
+            payload.setdefault("daily_boost", {})
+            payload.setdefault("thresholds", [])
+            blocks = payload.get("blocks")
+            if not isinstance(blocks, dict):
+                blocks = {}
+            for block in block_names:
+                blocks.setdefault(
+                    block,
+                    {"base": 0, "min": 0, "max": 0, "per_1000_sales": 0.0, "per_modifier": 0.0},
+                )
+            for stale in [name for name in list(blocks.keys()) if name not in block_names]:
+                blocks.pop(stale, None)
+            payload["blocks"] = blocks
+            roles_payload[role] = payload
+        return {
+            "name": params.get("name", "Default Policy"),
+            "description": params.get("description", ""),
+            "global": params.get("global")
+            if isinstance(params.get("global"), dict)
+            else {
+                "max_hours_week": 40,
+                "min_rest_hours": 10,
+                "max_consecutive_days": 6,
+                "round_to_minutes": 15,
+                "allow_split_shifts": True,
+                "desired_hours_floor_pct": 0.85,
+                "desired_hours_ceiling_pct": 1.15,
+                "open_buffer_minutes": 30,
+                "close_buffer_minutes": 35,
+            },
+            "timeblocks": timeblocks,
+            "business_hours": (
+                params.get("business_hours")
+                if isinstance(params.get("business_hours"), dict)
+                else _default_business_hours()
+            ),
+            "roles": roles_payload,
+        }
+
+    def _build_global_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        global_cfg = self.policy_payload.get("global", {})
+
+        self.max_hours_spin = QSpinBox()
+        self.max_hours_spin.setRange(10, 80)
+        self.max_hours_spin.setValue(int(global_cfg.get("max_hours_week", 40)))
+
+        self.min_rest_spin = QSpinBox()
+        self.min_rest_spin.setRange(1, 24)
+        self.min_rest_spin.setValue(int(global_cfg.get("min_rest_hours", 10)))
+
+        self.max_consec_spin = QSpinBox()
+        self.max_consec_spin.setRange(1, 7)
+        self.max_consec_spin.setValue(int(global_cfg.get("max_consecutive_days", 6)))
+
+        self.round_minutes_spin = QSpinBox()
+        self.round_minutes_spin.setRange(5, 60)
+        self.round_minutes_spin.setValue(int(global_cfg.get("round_to_minutes", 15)))
+
+        intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        guardrails_box = QGroupBox("Scheduling guardrails")
+        guard_form = QFormLayout(guardrails_box)
+        guard_form.addRow("Max hours per week", self.max_hours_spin)
+        guard_form.addRow("Min rest hours", self.min_rest_spin)
+        guard_form.addRow("Max consecutive days", self.max_consec_spin)
+        guard_form.addRow("Merge shifts within (minutes)", self.round_minutes_spin)
+        layout.addWidget(guardrails_box)
+
+        hours_box = QGroupBox("Operating hours")
+        hours_layout = QVBoxLayout(hours_box)
+        hours_layout.addWidget(QLabel("Times accept HH:MM, and values above 24:00 keep closers after midnight (e.g., 25:00 = 1 AM next day)."))
+        self.hours_table = QTableWidget(len(WEEKDAY_LABELS), 3)
+        self.hours_table.setHorizontalHeaderLabels(["Day", "Open", "Close"])
+        self.hours_table.verticalHeader().setVisible(False)
+        self.hours_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.hours_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.hours_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        business_hours = self.policy_payload.get("business_hours") or _default_business_hours()
+        for row, day in enumerate(WEEKDAY_LABELS):
+            day_item = QTableWidgetItem(day)
+            day_item.setFlags(Qt.ItemIsEnabled)
+            entry = business_hours.get(day, {})
+            open_item = QTableWidgetItem(entry.get("open", "11:00"))
+            close_item = QTableWidgetItem(entry.get("close", "23:00"))
+            self.hours_table.setItem(row, 0, day_item)
+            self.hours_table.setItem(row, 1, open_item)
+            self.hours_table.setItem(row, 2, close_item)
+        hours_layout.addWidget(self.hours_table)
+        layout.addWidget(hours_box)
+
+        desired_box = QGroupBox("Target desired hours range")
+        desired_form = QFormLayout(desired_box)
+        desired_floor_pct = float(global_cfg.get("desired_hours_floor_pct", 0.85) or 0.0) * 100
+        desired_ceiling_pct = float(global_cfg.get("desired_hours_ceiling_pct", 1.15) or 0.0) * 100
+        self.desired_floor_spin = QDoubleSpinBox()
+        self.desired_floor_spin.setDecimals(1)
+        self.desired_floor_spin.setRange(0.0, 150.0)
+        self.desired_floor_spin.setSuffix("%")
+        self.desired_floor_spin.setValue(max(0.0, min(150.0, desired_floor_pct)))
+        self.desired_ceiling_spin = QDoubleSpinBox()
+        self.desired_ceiling_spin.setDecimals(1)
+        self.desired_ceiling_spin.setRange(50.0, 250.0)
+        self.desired_ceiling_spin.setSuffix("%")
+        self.desired_ceiling_spin.setValue(max(self.desired_floor_spin.value(), min(250.0, desired_ceiling_pct)))
+        self.desired_floor_spin.valueChanged.connect(self._sync_desired_range_bounds)
+        self.desired_ceiling_spin.valueChanged.connect(self._sync_desired_range_bounds)
+        desired_form.addRow("Minimum coverage (% of desired)", self.desired_floor_spin)
+        desired_form.addRow("Maximum coverage (% of desired)", self.desired_ceiling_spin)
+        desired_note = QLabel("Employees below the minimum are prioritized, and the generator avoids exceeding the maximum unless absolutely necessary.")
+        desired_note.setWordWrap(True)
+        desired_form.addRow(desired_note)
+        layout.addWidget(desired_box)
+
+        self.split_checkbox = QCheckBox("Allow split shifts (return later the same day)")
+        self.split_checkbox.setChecked(bool(global_cfg.get("allow_split_shifts", True)))
+        split_note = QLabel("Disable this if you only want one continuous shift per person each day.")
+        split_note.setWordWrap(True)
+        shift_box = QGroupBox("Shift behavior")
+        shift_layout = QVBoxLayout(shift_box)
+        shift_layout.addWidget(self.split_checkbox)
+        buffer_form = QFormLayout()
+        self.open_buffer_spin = QSpinBox()
+        self.open_buffer_spin.setRange(0, 120)
+        self.open_buffer_spin.setValue(int(global_cfg.get("open_buffer_minutes", 30)))
+        self.close_buffer_spin = QSpinBox()
+        self.close_buffer_spin.setRange(0, 180)
+        self.close_buffer_spin.setValue(int(global_cfg.get("close_buffer_minutes", 35)))
+        buffer_form.addRow("Open buffer (minutes)", self.open_buffer_spin)
+        buffer_form.addRow("Close buffer (minutes)", self.close_buffer_spin)
+        shift_layout.addLayout(buffer_form)
+        shift_layout.addWidget(split_note)
+        layout.addWidget(shift_box)
+        layout.addStretch(1)
+        return widget
+
+    def _build_timeblocks_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.block_table = QTableWidget(0, 3)
+        self.block_table.setHorizontalHeaderLabels(["Name", "Start", "End"])
+        self.block_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.block_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.block_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.block_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.block_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.block_table)
+        controls = QHBoxLayout()
+        add_btn = QPushButton("Add block")
+        remove_btn = QPushButton("Remove block")
+        add_btn.clicked.connect(self._add_block_row)
+        remove_btn.clicked.connect(self._remove_block_row)
+        controls.addWidget(add_btn)
+        controls.addWidget(remove_btn)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        help_label = QLabel(
+            "Use HH:MM or anchors like @open, @open-30, @close, @close+35. Anchors resolve per day using the Operating hours on the Global rules tab."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet(f"color:{INFO_COLOR};")
+        layout.addWidget(help_label)
+
+        for row in self.policy_payload["timeblocks"]:
+            self._append_block_row(row["name"], row["start"], row["end"])
+        self.block_table.itemChanged.connect(self._handle_block_edit)
+        return widget
+
+    def _build_roles_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        self.role_list = QListWidget()
+        for role in ROLE_CATALOG:
+            item = QListWidgetItem(role)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+            item.setCheckState(Qt.Checked if self.role_models.get(role, {}).get("enabled") else Qt.Unchecked)
+            self.role_list.addItem(item)
+        self.role_list.currentItemChanged.connect(self._handle_role_selection)
+        self.role_list.itemChanged.connect(self._handle_role_check_changed)
+
+        self.role_detail = QWidget()
+        detail_layout = QVBoxLayout(self.role_detail)
+        self.role_enabled_checkbox = QCheckBox("Role enabled")
+        self.role_enabled_checkbox.stateChanged.connect(self._handle_role_enabled_toggle)
+        detail_layout.addWidget(self.role_enabled_checkbox)
+
+        form = QFormLayout()
+        self.priority_spin = QDoubleSpinBox()
+        self.priority_spin.setRange(0.1, 10.0)
+        self.priority_spin.setSingleStep(0.1)
+        self.max_weekly_spin = QSpinBox()
+        self.max_weekly_spin.setRange(5, 80)
+        form.addRow("Priority weight", self.priority_spin)
+        form.addRow("Max weekly hours", self.max_weekly_spin)
+        detail_layout.addLayout(form)
+
+        block_box = QGroupBox("Block staffing")
+        block_layout = QVBoxLayout(block_box)
+        self.role_block_table = QTableWidget(0, 6)
+        self.role_block_table.setHorizontalHeaderLabels(
+            ["Block", "Target staff", "Min staff", "Max staff", "Extra per $1k sales", "Extra per modifier"]
+        )
+        self.role_block_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.role_block_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.role_block_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.role_block_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.role_block_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.role_block_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        block_layout.addWidget(self.role_block_table)
+        block_help = QLabel(
+            "Target staff is the number of people you want assigned before auto-scaling kicks in. "
+            "Use the extra columns when you want busy days (higher sales/modifiers) to add staff automatically."
+        )
+        block_help.setWordWrap(True)
+        block_help.setStyleSheet(f"color:{INFO_COLOR};")
+        block_layout.addWidget(block_help)
+        detail_layout.addWidget(block_box)
+
+        threshold_box = QGroupBox("Demand thresholds")
+        threshold_layout = QVBoxLayout(threshold_box)
+        threshold_layout.addWidget(
+            QLabel("Optional rules that add staff when demand metrics exceed the provided thresholds.")
+        )
+        self.threshold_table = QTableWidget(0, 3)
+        self.threshold_table.setHorizontalHeaderLabels(["Metric", "≥ value", "Add staff"])
+        self.threshold_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.threshold_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.threshold_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        threshold_layout.addWidget(self.threshold_table)
+        threshold_controls = QHBoxLayout()
+        threshold_add = QPushButton("Add rule")
+        threshold_remove = QPushButton("Remove rule")
+        threshold_add.clicked.connect(self._add_threshold_row)
+        threshold_remove.clicked.connect(self._remove_threshold_row)
+        threshold_controls.addWidget(threshold_add)
+        threshold_controls.addWidget(threshold_remove)
+        threshold_controls.addStretch()
+        threshold_layout.addLayout(threshold_controls)
+        detail_layout.addWidget(threshold_box)
+
+        daily_box = QGroupBox("Daily boost (extra staff per day)")
+        daily_layout = QGridLayout(daily_box)
+        self.daily_spinboxes: Dict[str, QSpinBox] = {}
+        for idx, day in enumerate(WEEKDAY_LABELS):
+            spin = QSpinBox()
+            spin.setRange(-5, 10)
+            self.daily_spinboxes[day] = spin
+            daily_layout.addWidget(QLabel(day), 0, idx)
+            daily_layout.addWidget(spin, 1, idx)
+        detail_layout.addWidget(daily_box)
+        detail_layout.addStretch()
+
+        layout.addWidget(self.role_list, 1)
+        layout.addWidget(self.role_detail, 3)
+        return widget
+
+    def _add_block_row(self) -> None:
+        self._append_block_row("New Block", "09:00", "13:00")
+        self._sync_role_blocks()
+
+    def _remove_block_row(self) -> None:
+        row = self.block_table.currentRow()
+        if row < 0:
+            return
+        self.block_table.blockSignals(True)
+        self.block_table.removeRow(row)
+        self.block_table.blockSignals(False)
+        self._sync_role_blocks()
+        self._populate_role_block_table()
+
+    def _add_threshold_row(self) -> None:
+        row = self.threshold_table.rowCount()
+        self.threshold_table.insertRow(row)
+        self.threshold_table.setItem(row, 0, QTableWidgetItem("demand_index"))
+        self.threshold_table.setItem(row, 1, QTableWidgetItem("0.80"))
+        self.threshold_table.setItem(row, 2, QTableWidgetItem("1"))
+
+    def _remove_threshold_row(self) -> None:
+        row = self.threshold_table.currentRow()
+        if row < 0:
+            return
+        self.threshold_table.removeRow(row)
+
+    def _append_block_row(self, name: str, start: str, end: str) -> None:
+        self.block_table.blockSignals(True)
+        row = self.block_table.rowCount()
+        self.block_table.insertRow(row)
+        for col, value in enumerate([name, start, end]):
+            item = QTableWidgetItem(value)
+            self.block_table.setItem(row, col, item)
+        self.block_table.blockSignals(False)
+
+    def _handle_block_edit(self, _) -> None:
+        self._sync_role_blocks()
+        self._populate_role_block_table()
+
+    def _sync_desired_range_bounds(self) -> None:
+        if not hasattr(self, "desired_floor_spin") or not hasattr(self, "desired_ceiling_spin"):
+            return
+        floor = self.desired_floor_spin.value()
+        if self.desired_ceiling_spin.value() < floor:
+            self.desired_ceiling_spin.setValue(floor)
+
+    def _handle_role_selection(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
+        self._persist_role_detail()
+        if not current:
+            self.current_role = None
+            return
+        self.current_role = current.text()
+        self._load_role_detail()
+
+    def _handle_role_check_changed(self, item: QListWidgetItem) -> None:
+        role = item.text()
+        if role in self.role_models:
+            self.role_models[role]["enabled"] = item.checkState() == Qt.Checked
+        if self.current_role == role:
+            self.role_enabled_checkbox.setChecked(self.role_models[role]["enabled"])
+
+    def _handle_role_enabled_toggle(self) -> None:
+        if not self.current_role:
+            return
+        state = self.role_enabled_checkbox.isChecked()
+        self.role_models[self.current_role]["enabled"] = state
+        items = self.role_list.findItems(self.current_role, Qt.MatchExactly)
+        for item in items:
+            item.setCheckState(Qt.Checked if state else Qt.Unchecked)
+
+    def _load_role_detail(self) -> None:
+        if not self.current_role:
+            return
+        data = self.role_models.get(self.current_role, _default_role_payload(self._block_names()))
+        self.role_enabled_checkbox.setChecked(data.get("enabled", False))
+        self.priority_spin.setValue(float(data.get("priority", 1.0)))
+        self.max_weekly_spin.setValue(int(data.get("max_weekly_hours", 35)))
+
+        boosts = data.get("daily_boost", {}) or {}
+        for day, spin in self.daily_spinboxes.items():
+            spin.blockSignals(True)
+            spin.setValue(int(boosts.get(day, 0)))
+            spin.blockSignals(False)
+        self._populate_role_block_table()
+        self._populate_threshold_table()
+
+    def _populate_role_block_table(self) -> None:
+        if not self.current_role:
+            self.role_block_table.setRowCount(0)
+            return
+        data = self.role_models.setdefault(self.current_role, _default_role_payload(self._block_names()))
+        blocks = data.setdefault("blocks", {})
+        block_names = self._block_names()
+        self.role_block_table.blockSignals(True)
+        self.role_block_table.setRowCount(len(block_names))
+        for row, block_name in enumerate(block_names):
+            config = blocks.setdefault(
+                block_name,
+                {"base": 0, "min": 0, "max": 0, "per_1000_sales": 0.0, "per_modifier": 0.0},
+            )
+            name_item = QTableWidgetItem(block_name)
+            name_item.setFlags(Qt.ItemIsEnabled)
+            self.role_block_table.setItem(row, 0, name_item)
+            self.role_block_table.setItem(row, 1, QTableWidgetItem(str(int(config.get("base", 0)))))
+            self.role_block_table.setItem(row, 2, QTableWidgetItem(str(int(config.get("min", config.get("base", 0))))))
+            self.role_block_table.setItem(row, 3, QTableWidgetItem(str(int(config.get("max", config.get("base", 0))))))
+            self.role_block_table.setItem(
+                row,
+                4,
+                QTableWidgetItem(f"{float(config.get('per_1000_sales', 0.0)):.2f}"),
+            )
+            self.role_block_table.setItem(
+                row,
+                5,
+                QTableWidgetItem(f"{float(config.get('per_modifier', 0.0)):.2f}"),
+            )
+        self.role_block_table.blockSignals(False)
+
+    def _populate_threshold_table(self) -> None:
+        if not self.current_role:
+            self.threshold_table.setRowCount(0)
+            return
+        data = self.role_models.setdefault(self.current_role, _default_role_payload(self._block_names()))
+        rules = data.get("thresholds") or []
+        self.threshold_table.blockSignals(True)
+        self.threshold_table.setRowCount(len(rules))
+        for row, rule in enumerate(rules):
+            metric = (rule.get("metric") or "demand_index") if isinstance(rule, dict) else "demand_index"
+            gte = rule.get("gte", 0.0) if isinstance(rule, dict) else 0.0
+            add = rule.get("add", 0) if isinstance(rule, dict) else 0
+            self.threshold_table.setItem(row, 0, QTableWidgetItem(str(metric)))
+            self.threshold_table.setItem(row, 1, QTableWidgetItem(f"{float(gte):.2f}"))
+            self.threshold_table.setItem(row, 2, QTableWidgetItem(str(int(add))))
+        self.threshold_table.blockSignals(False)
+
+    def _read_threshold_rows(self) -> List[Dict[str, float | int | str]]:
+        rows: List[Dict[str, float | int | str]] = []
+        for row in range(self.threshold_table.rowCount()):
+            metric = (self.threshold_table.item(row, 0).text() if self.threshold_table.item(row, 0) else "").strip()
+            if not metric:
+                metric = "demand_index"
+            gte = self._parse_table_float(self.threshold_table.item(row, 1))
+            add = self._parse_table_int(self.threshold_table.item(row, 2))
+            rows.append({"metric": metric, "gte": gte, "add": add})
+        return rows
+
+    def _persist_role_detail(self) -> None:
+        if not self.current_role:
+            return
+        data = self.role_models.setdefault(self.current_role, _default_role_payload(self._block_names()))
+        data["enabled"] = self.role_enabled_checkbox.isChecked()
+        data["priority"] = float(self.priority_spin.value())
+        data["max_weekly_hours"] = int(self.max_weekly_spin.value())
+        boosts = {}
+        for day, spin in self.daily_spinboxes.items():
+            if spin.value() != 0:
+                boosts[day] = spin.value()
+        data["daily_boost"] = boosts
+        blocks = data.setdefault("blocks", {})
+        block_names = self._block_names()
+        for row, block_name in enumerate(block_names):
+            base = self._parse_table_int(self.role_block_table.item(row, 1))
+            min_staff = self._parse_table_int(self.role_block_table.item(row, 2))
+            max_staff = self._parse_table_int(self.role_block_table.item(row, 3))
+            per_sales = self._parse_table_float(self.role_block_table.item(row, 4))
+            per_modifier = self._parse_table_float(self.role_block_table.item(row, 5))
+            blocks[block_name] = {
+                "base": base,
+                "min": min_staff if min_staff else base,
+                "max": max_staff if max_staff else max(base, min_staff),
+                "per_1000_sales": per_sales,
+                "per_modifier": per_modifier,
+            }
+        for stale in [name for name in list(blocks.keys()) if name not in block_names]:
+            blocks.pop(stale, None)
+        data["thresholds"] = self._read_threshold_rows()
+
+    def _parse_table_int(self, item: Optional[QTableWidgetItem]) -> int:
+        if not item:
+            return 0
+        try:
+            return int(item.text())
+        except (TypeError, ValueError):
+            return 0
+
+    def _parse_table_float(self, item: Optional[QTableWidgetItem]) -> float:
+        if not item:
+            return 0.0
+        try:
+            return float(item.text())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _read_timeblocks(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for row in range(self.block_table.rowCount()):
+            name = (self.block_table.item(row, 0).text() if self.block_table.item(row, 0) else "").strip()
+            if not name:
+                continue
+            start = (self.block_table.item(row, 1).text() if self.block_table.item(row, 1) else "09:00").strip()
+            end = (self.block_table.item(row, 2).text() if self.block_table.item(row, 2) else "17:00").strip()
+            rows.append({"name": name, "start": start, "end": end})
+        return rows or _default_timeblocks()
+
+    def _block_names(self) -> List[str]:
+        return [row["name"] for row in self._read_timeblocks()]
+
+    def _read_business_hours(self) -> Dict[str, Dict[str, str]]:
+        hours: Dict[str, Dict[str, str]] = {}
+        for row, day in enumerate(WEEKDAY_LABELS):
+            open_item = self.hours_table.item(row, 1)
+            close_item = self.hours_table.item(row, 2)
+            open_label = (open_item.text() if open_item else "11:00").strip() or "11:00"
+            close_label = (close_item.text() if close_item else "23:00").strip() or "23:00"
+            hours[day] = {"open": open_label, "close": close_label}
+        return hours
+
+    def _sync_role_blocks(self) -> None:
+        block_names = self._block_names()
+        for role in ROLE_CATALOG:
+            data = self.role_models.setdefault(role, _default_role_payload(block_names))
+            blocks = data.setdefault("blocks", {})
+            for block in block_names:
+                blocks.setdefault(
+                    block,
+                    {"base": 0, "min": 0, "max": 0, "per_1000_sales": 0.0, "per_modifier": 0.0},
+                )
+            for stale in [name for name in list(blocks.keys()) if name not in block_names]:
+                blocks.pop(stale, None)
+
     def accept(self) -> None:
         name = self.name_input.text().strip()
         if not name:
-            self.feedback_label.setText("Provide a name for this policy.")
+            self.feedback_label.setText("Provide a policy name.")
             return
-        raw = self.json_edit.toPlainText().strip() or "{}"
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as e:
-            self.feedback_label.setText(f"Invalid JSON: {e}")
-            return
-        if not isinstance(parsed, dict):
-            self.feedback_label.setText("Top-level JSON must be an object (dictionary).")
-            return
-        self.result_data = {"name": name, "params": parsed}
+        self._persist_role_detail()
+        self.policy_payload["name"] = name
+        self.policy_payload["description"] = self.description_input.text().strip()
+        self.policy_payload["global"] = {
+            "max_hours_week": self.max_hours_spin.value(),
+            "min_rest_hours": self.min_rest_spin.value(),
+            "max_consecutive_days": self.max_consec_spin.value(),
+            "round_to_minutes": self.round_minutes_spin.value(),
+            "allow_split_shifts": self.split_checkbox.isChecked(),
+            "desired_hours_floor_pct": round(self.desired_floor_spin.value() / 100, 3),
+            "desired_hours_ceiling_pct": round(self.desired_ceiling_spin.value() / 100, 3),
+            "open_buffer_minutes": self.open_buffer_spin.value(),
+            "close_buffer_minutes": self.close_buffer_spin.value(),
+        }
+        timeblock_rows = self._read_timeblocks()
+        self.policy_payload["timeblocks"] = [
+            {"name": row["name"], "start": row["start"], "end": row["end"]} for row in timeblock_rows
+        ]
+        self.policy_payload["business_hours"] = self._read_business_hours()
+        params = {
+            "description": self.policy_payload.get("description", ""),
+            "global": self.policy_payload["global"],
+            "timeblocks": {
+                row["name"]: {"start": row["start"], "end": row["end"]} for row in self.policy_payload["timeblocks"]
+            },
+            "business_hours": self.policy_payload["business_hours"],
+            "roles": self.role_models,
+        }
+        self.result_data = {"name": name, "params": params}
         super().accept()
 
 
@@ -1791,13 +2873,14 @@ class PolicyDialog(QDialog):
         self.current_user = current_user
         self.read_only = read_only
         self.setWindowTitle("Policies")
+        self.resize(1100, 640)
         self.policies: List[Policy] = []
         self._build_ui()
         self._load_policies()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        intro = QLabel("Define schedule generation and validation rules. JSON must be a valid object.")
+        intro = QLabel("Manage the store scheduling policies. Use Add or Edit to open the GM-friendly settings view.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -1840,6 +2923,7 @@ class PolicyDialog(QDialog):
             self.delete_button.setEnabled(False)
 
         self.table.itemSelectionChanged.connect(self._update_buttons)
+        self.table.cellDoubleClicked.connect(lambda *_: self.handle_edit())
         self._update_buttons()
 
     def _update_buttons(self) -> None:
@@ -1880,7 +2964,7 @@ class PolicyDialog(QDialog):
     def handle_add(self) -> None:
         if self.read_only:
             return
-        dialog = PolicyEditDialog()
+        dialog = PolicyComposerDialog()
         dialog.setStyleSheet(THEME_STYLESHEET)
         if dialog.exec() != QDialog.Accepted or not dialog.result_data:
             return
@@ -1903,7 +2987,7 @@ class PolicyDialog(QDialog):
         policy = self._selected_policy()
         if not policy:
             return
-        dialog = PolicyEditDialog(name=policy.name, params=policy.params_dict())
+        dialog = PolicyComposerDialog(name=policy.name, params=policy.params_dict())
         dialog.setStyleSheet(THEME_STYLESHEET)
         if dialog.exec() != QDialog.Accepted or not dialog.result_data:
             return
@@ -2455,7 +3539,8 @@ class EmployeeDirectoryDialog(QDialog):
         self.employees: List[Employee] = []
         self.visible_employees: List[Employee] = []
         self.setWindowTitle("Employee directory")
-        self.resize(780, 460)
+        self.resize(1100, 460)
+        self.setMinimumWidth(1100)
         self._build_ui()
         self.refresh_table()
 
@@ -2610,7 +3695,46 @@ class EmployeeDirectoryDialog(QDialog):
         employee = self.selected_employee()
         if not employee:
             return
-        new_status = "inactive" if employee.status == "active" else "active"
+        action = self._prompt_employee_action(employee)
+        if action == "delete":
+            self._delete_employee(employee)
+        elif action == "toggle":
+            new_status = "inactive" if employee.status == "active" else "active"
+            self._update_employee_status(employee, new_status)
+
+    def _prompt_employee_action(self, employee: Employee) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Update employee")
+        dialog.setText(f"What would you like to do with {employee.full_name}?")
+        status_label = "Deactivate" if employee.status == "active" else "Activate"
+        status_button = dialog.addButton(status_label, QMessageBox.ActionRole)
+        delete_button = dialog.addButton("Delete", QMessageBox.ActionRole)
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(status_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked == delete_button:
+            return "delete"
+        if clicked == status_button:
+            return "toggle"
+        return "cancel"
+
+    def _delete_employee(self, employee: Employee) -> None:
+        with self.session_factory() as session:
+            db_employee = session.get(Employee, employee.id)
+            if not db_employee:
+                return
+            session.delete(db_employee)
+            session.commit()
+        audit_logger.log(
+            "employee_delete",
+            self.actor["username"],
+            role=self.actor.get("role"),
+            details={"employee_id": employee.id, "full_name": employee.full_name},
+        )
+        self.refresh_table()
+
+    def _update_employee_status(self, employee: Employee, new_status: str) -> None:
         with self.session_factory() as session:
             db_employee = session.get(Employee, employee.id)
             if not db_employee:
@@ -2718,13 +3842,12 @@ class MainWindow(QMainWindow):
         self.session_factory = session_factory
         self.active_week = load_active_week(self.session_factory)
         self.setWindowTitle("Schedule Assistant")
-        self.resize(720, 440)
+        self.setMinimumSize(1100, 720)
+        self._resize_to_screen()
         self._build_ui()
         self._init_session_timeout()
 
-    def _build_ui(self) -> None:
-        # Wrap the entire central content in a scroll area so the app is
-        # traversible on smaller displays and different Windows variants.
+    def _build_week_preparation_tab(self) -> QScrollArea:
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
 
@@ -2736,8 +3859,8 @@ class MainWindow(QMainWindow):
         role_label = QLabel(f"Current role: <b>{self.user['role']}</b>")
         role_label.setStyleSheet("color:#c9cede;")
         intro = QLabel(
-            "Use the demand planning workspace below to capture projected sales and highlight high-impact days "
-            "before the scheduling pass."
+            "Use the week preparation workspace below to capture projected sales and highlight high-impact days "
+            "before you build and validate the schedule."
         )
         intro.setWordWrap(True)
 
@@ -2775,12 +3898,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(intro)
         layout.addSpacing(16)
 
-        self.demand_widget = DemandPlanningWidget(
+        self.preparation_widget = DemandPlanningWidget(
             self.session_factory,
             self.user,
             self.active_week,
         )
-        layout.addWidget(self.demand_widget)
+        layout.addWidget(self.preparation_widget)
         layout.addStretch(1)
 
         footer_row = QHBoxLayout()
@@ -2790,17 +3913,21 @@ class MainWindow(QMainWindow):
             manage_accounts_button.clicked.connect(self.open_account_manager)
             footer_row.addWidget(manage_accounts_button)
 
-        # Manage Policies action with role-based visibility
-        self.policy_action = QPushButton("Manage policies")
-        self.policy_action.clicked.connect(self.open_policy_manager)
-        # Visibility and enablement rules
+        self.policy_library_button = QPushButton("Policy library")
+        self.policy_library_button.clicked.connect(self.open_policy_manager)
+        self.policy_editor_button = QPushButton("Edit active policy")
+        self.policy_editor_button.clicked.connect(self.open_active_policy_editor)
+
         if self.user_role in {"IT", "GM"}:
-            footer_row.addWidget(self.policy_action)
+            footer_row.addWidget(self.policy_library_button)
+            footer_row.addWidget(self.policy_editor_button)
         elif SHOW_POLICY_TO_SM and self.user_role == "SM":
-            footer_row.addWidget(self.policy_action)
-        # Enforce disabled state for non-editor roles unless read-only is allowed
-        if self.user_role not in ("GM", "IT") and not (SHOW_POLICY_TO_SM and self.user_role == "SM"):
-            self.policy_action.setEnabled(False)
+            footer_row.addWidget(self.policy_library_button)
+            self.policy_library_button.setEnabled(False)
+            self.policy_editor_button.setVisible(False)
+        else:
+            self.policy_library_button.setEnabled(False)
+            self.policy_editor_button.setVisible(False)
 
         change_password_button = QPushButton("Change password")
         change_password_button.clicked.connect(self.open_change_password)
@@ -2809,7 +3936,45 @@ class MainWindow(QMainWindow):
         layout.addLayout(footer_row)
 
         scroll_area.setWidget(content)
-        self.setCentralWidget(scroll_area)
+        return scroll_area
+
+    def _build_ui(self) -> None:
+        prep_tab = self._build_week_preparation_tab()
+        self.tabs = QTabWidget()
+        self.week_schedule_page = WeekSchedulePage(
+            self.session_factory,
+            self.user,
+            self.active_week,
+            on_week_changed=self._handle_schedule_week_change,
+            on_back=lambda: self.tabs.setCurrentIndex(0),
+        )
+        self.validation_page = ValidationImportExportPage(
+            self.session_factory,
+            self.user,
+            self.active_week,
+            on_week_changed=self._handle_validation_week_change,
+            on_status_updated=self._handle_validation_status_updated,
+        )
+        self.tabs.addTab(prep_tab, "Week Preparation")
+        self.tabs.addTab(self.week_schedule_page, "Week Schedule")
+        self.tabs.addTab(self.validation_page, "Validate / Import / Export")
+        enabled = self.week_schedule_page.week_start is not None
+        self.tabs.setTabEnabled(1, enabled)
+        self.tabs.setTabEnabled(2, enabled)
+        self.tabs.setCurrentIndex(0)
+        self.setCentralWidget(self.tabs)
+
+    def _resize_to_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 840)
+            return
+        available = screen.availableGeometry()
+        width = max(int(available.width() * 0.85), self.minimumWidth())
+        height = max(int(available.height() * 0.85), self.minimumHeight())
+        self.resize(width, height)
+        center = available.center()
+        self.move(center.x() - width // 2, center.y() - height // 2)
 
     def on_week_changed(self, iso_year: int, iso_week: int, label: str) -> None:
         if (
@@ -2819,8 +3984,16 @@ class MainWindow(QMainWindow):
             return
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
         save_active_week(iso_year, iso_week)
-        if hasattr(self, "demand_widget") and self.demand_widget:
-            self.demand_widget.set_active_week(self.active_week)
+        if hasattr(self, "preparation_widget") and self.preparation_widget:
+            self.preparation_widget.set_active_week(self.active_week)
+        if hasattr(self, "week_schedule_page") and self.week_schedule_page:
+            self.week_schedule_page.set_active_week(self.active_week)
+        if hasattr(self, "validation_page") and self.validation_page:
+            self.validation_page.set_active_week(self.active_week)
+        if hasattr(self, "tabs"):
+            self.tabs.setTabEnabled(1, True)
+            if self.tabs.count() > 2:
+                self.tabs.setTabEnabled(2, True)
         audit_logger.log(
             "week_context_change",
             self.user["username"],
@@ -2828,6 +4001,26 @@ class MainWindow(QMainWindow):
             details={"iso_year": iso_year, "iso_week": iso_week, "label": label},
         )
         self.reset_session_timers()
+
+    def _handle_schedule_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
+        computed_label = week_label(iso_year, iso_week)
+        self.on_week_changed(iso_year, iso_week, computed_label)
+        if hasattr(self, "week_selector"):
+            self.week_selector.set_active_week(
+                {"iso_year": iso_year, "iso_week": iso_week, "label": computed_label}
+            )
+
+    def _handle_validation_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
+        computed_label = week_label(iso_year, iso_week)
+        self.on_week_changed(iso_year, iso_week, computed_label)
+        if hasattr(self, "week_selector"):
+            self.week_selector.set_active_week(
+                {"iso_year": iso_year, "iso_week": iso_week, "label": computed_label}
+            )
+
+    def _handle_validation_status_updated(self, status: str) -> None:
+        if hasattr(self, "week_schedule_page") and self.week_schedule_page:
+            self.week_schedule_page.refresh_all()
 
     def _init_session_timeout(self) -> None:
         self._warning_shown = False
@@ -2905,12 +4098,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Password updated", "Your password has been changed successfully.")
 
     def open_policy_manager(self) -> None:
-        # Determine access level
-        if self.user_role in {"GM", "IT"}:
-            read_only = False
-        elif SHOW_POLICY_TO_SM and self.user_role == "SM":
-            read_only = True
-        else:
+        read_only = not (self.user_role in {"GM", "IT"})
+        if read_only and not (SHOW_POLICY_TO_SM and self.user_role == "SM"):
             QMessageBox.information(
                 self,
                 "Access restricted",
@@ -2921,13 +4110,41 @@ class MainWindow(QMainWindow):
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
 
+    def open_active_policy_editor(self) -> None:
+        if self.user_role not in {"GM", "IT"}:
+            self.open_policy_manager()
+            return
+        with self.session_factory() as session:
+            policy = get_active_policy(session)
+        dialog = PolicyComposerDialog(
+            name=policy.name if policy else "",
+            params=policy.params_dict() if policy else None,
+        )
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
+            return
+        data = dialog.result_data
+        with self.session_factory() as session:
+            saved = upsert_policy(
+                session,
+                data["name"],
+                data["params"],
+                edited_by=self.user.get("username", "system"),
+            )
+        audit_logger.log(
+            "policy_update",
+            self.user.get("username", "unknown"),
+            role=self.user.get("role"),
+            details={"policy_id": saved.id, "name": saved.name},
+        )
+        QMessageBox.information(self, "Policy saved", f"Policy '{saved.name}' updated.")
+
     def handle_logout(self) -> None:
         confirm = QMessageBox.question(self, "Sign out", "Return to sign-in screen?")
         if confirm == QMessageBox.Yes:
             self.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        # On exit, we simply accept. Main application loop handles showing login again if needed.
         event.accept()
 
 
@@ -2940,6 +4157,7 @@ def launch_app() -> int:
 
     store = AccountStore(ACCOUNTS_FILE)
     init_database()
+    ensure_default_policy(SessionLocal)
 
     while True:
         login = LoginDialog(store)
@@ -2949,7 +4167,6 @@ def launch_app() -> int:
 
         authenticated = login.authenticated_user
         if not authenticated:
-            # Should not happen since dialog returns Accepted only on success, but guard anyway.
             continue
 
         window = MainWindow(store, authenticated, SessionLocal)
@@ -2959,7 +4176,6 @@ def launch_app() -> int:
         window.show()
         app.exec()
 
-        # After window closes (logout or quit), decide whether to prompt for login again.
         logout = QMessageBox.question(
             None,
             "Session ended",

@@ -9,14 +9,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Local databases and logs
-app/data/*.db
-app/data/*.sqlite
-app/data/*.sqlite3
-app/data/audit.log
-
-# Sensitive seeded data
-app/data/accounts.json
+# Local runtime data (databases, exports, logs, etc.)
+app/data/**
+!app/data/.gitkeep
 TODO.txt
 
 # OS / editor

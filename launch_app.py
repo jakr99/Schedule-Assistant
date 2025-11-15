@@ -42,10 +42,10 @@ def ensure_requirements() -> None:
     signature = current_requirements_signature()
 
     if REQUIREMENTS_MARKER.exists() and REQUIREMENTS_MARKER.read_text().strip() == signature:
-        print("[launcher] Dependencies already satisfied.")
+        print("[launcher] Dependencies satisfied.")
         return
 
-    print("[launcher] Ensuring pip is up to date...")
+    print("[launcher] Making sure pip is up to date...")
     subprocess.check_call(
         [
             str(python_exec),
@@ -90,7 +90,7 @@ if __name__ == "__main__":
     except subprocess.CalledProcessError as exc:
         print(f"[launcher] Command failed with exit code {exc.returncode}", file=sys.stderr)
         sys.exit(exc.returncode)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc: 
         print(f"[launcher] {exc}", file=sys.stderr)
         sys.exit(1)
     else:
