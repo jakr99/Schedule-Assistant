@@ -85,7 +85,7 @@ from data_exchange import (
     import_week_projections,
     import_week_schedule,
 )
-from policy_defaults import ensure_default_policy
+from policy import ensure_default_policy
 from roles import ROLE_GROUPS
 from ui.week_view import WeekSchedulePage
 

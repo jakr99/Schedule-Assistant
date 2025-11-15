@@ -29,7 +29,7 @@ from database import (  # noqa: E402
 )
 from exporter import export_week  # noqa: E402
 from generator.api import generate_schedule_for_week  # noqa: E402
-from policy_defaults import ensure_default_policy  # noqa: E402
+from policy import ensure_default_policy  # noqa: E402
 
 
 def _default_week_start(today: datetime.date | None = None) -> datetime.date:
