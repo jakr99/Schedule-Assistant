@@ -96,3 +96,22 @@ Run it once on a fresh database to get 65+ FOH/BOH records for demos and tests, 
   ```
 - If UI assets fail to load, confirm the app is running inside the repo root so paths resolve correctly.
 
+### Assignment note: low-cohesion schema (conceptual)
+- The live app uses a high-cohesion, FK-backed schema (`app/database.py`).
+- For the Lecture 19 low-cohesion assignment, see `docs/low_cohesion_schema.md` (concepts + ERD) and `docs/low_cohesion_schema.sql` (DDL sketch without foreign keys). These files are documentation-only and not wired into the running app.
+
+### REST API (additive, optional)
+- A lightweight FastAPI wrapper is available at `app/api.py`; it sits on the current schema (high cohesion) and exposes:
+  - `GET /health`
+  - `POST /api/v1/auth/login` (stubbed to the default demo user)
+  - `GET /api/v1/weeks/{week}/summary`
+  - `GET /api/v1/weeks/{week}/modifiers`
+  - `GET /api/v1/weeks/{week}/shifts`
+  - `POST /api/v1/weeks/{week}/projection`
+  - `POST /api/v1/modifiers/apply-template`
+  - `POST /api/v1/schedules/generate`
+  - `POST /api/v1/schedules/{week}/publish`
+  - `GET/PUT /api/v1/policy/active`
+  - `POST /api/v1/employees/{id}/roles-wages`
+- Run with: `uvicorn app.api:app --reload`
+

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTimeEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QHeaderView,
@@ -91,7 +92,7 @@ from data_exchange import (
     import_week_projections,
     import_week_schedule,
 )
-from policy import build_default_policy, ensure_default_policy
+from policy import build_default_policy, ensure_default_policy, role_catalog
 from wages import (
     baseline_wages,
     export_wages as export_wages_file,
@@ -1163,6 +1164,13 @@ class ValidationImportExportPage(QWidget):
         summary_layout.addRow("Projected labor", self.cost_label)
         layout.addWidget(summary_box)
 
+        validation_box = QGroupBox("Validation & warnings")
+        validation_layout = QVBoxLayout(validation_box)
+        self.validation_list = QListWidget()
+        self.validation_list.setAlternatingRowColors(True)
+        validation_layout.addWidget(self.validation_list)
+        layout.addWidget(validation_box)
+
         self.feedback_label = QLabel()
         self.feedback_label.setWordWrap(True)
         layout.addWidget(self.feedback_label)
@@ -1234,6 +1242,7 @@ class ValidationImportExportPage(QWidget):
         if self.week_selector:
             self.week_selector.set_active_week(active_week)
         self._refresh_summary()
+        self._refresh_validation_notes()
 
     def _current_week_start(self) -> Optional[datetime.date]:
         if not self.active_week:
@@ -1274,9 +1283,32 @@ class ValidationImportExportPage(QWidget):
         if hasattr(self, "copy_week_button"):
             self.copy_week_button.setEnabled(bool(dataset) and dataset != "employees" and has_week)
 
+    def _refresh_validation_notes(self) -> None:
+        self.validation_list.clear()
+        week_start = self._current_week_start()
+        if not week_start:
+            return
+        with self.session_factory() as session:
+            summary = get_week_summary(session, week_start)
+            shifts = get_shifts_for_week(session, week_start)
+            policy = load_active_policy_spec(self.session_factory)
+        empty_days = [day["date"] for day in summary.get("days", []) if day.get("count", 0) == 0]
+        if empty_days:
+            self.validation_list.addItem(f"No coverage scheduled for: {', '.join(empty_days)}")
+        unassigned = [s for s in shifts if not s.get("employee_id")]
+        if unassigned:
+            self.validation_list.addItem(f"{len(unassigned)} unassigned shift(s) remain.")
+        missing_wages = validate_wages(role_catalog(policy))
+        if missing_wages:
+            roles_list = ", ".join(sorted(missing_wages.keys()))
+            self.validation_list.addItem(f"Wages missing/unchecked for: {roles_list}")
+        if summary.get("total_cost", 0) <= 0:
+            self.validation_list.addItem("No labor cost recorded yet. Validate after generating schedule.")
+
     def _handle_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
         self._refresh_summary()
+        self._refresh_validation_notes()
         if self.on_week_changed:
             self.on_week_changed(iso_year, iso_week, label)
 
@@ -2579,6 +2611,15 @@ class PolicyComposerDialog(QDialog):
         if ROLE_CATALOG:
             self.role_list.setCurrentRow(0)
 
+    @staticmethod
+    def _disable_scroll_wheel(widgets: List[Optional[QWidget]]) -> None:
+        """Prevent accidental mouse-wheel changes on numeric/date inputs."""
+        for widget in widgets:
+            if widget is None:
+                continue
+            widget.setFocusPolicy(Qt.StrongFocus)
+            widget.wheelEvent = lambda event: event.ignore()
+
     def _initial_policy(self, params: Dict[str, Any]) -> Dict[str, Any]:
         timeblocks = _timeblocks_from_params(params)
         block_names = [row["name"] for row in timeblocks]
@@ -3328,7 +3369,8 @@ class PolicyDialog(QDialog):
         global_form.addRow("Opener/Closer order bias", self.open_close_combo)
         layout.addWidget(global_box)
 
-        labor_box = QGroupBox("Labor budget")
+        labor_box = QGroupBox()
+        labor_box.setTitle("")
         labor_form = QFormLayout(labor_box)
         self.labor_budget_spin = QDoubleSpinBox()
         self.labor_budget_spin.setRange(5.0, 60.0)
@@ -3342,7 +3384,8 @@ class PolicyDialog(QDialog):
         labor_form.addRow("Allowed variance (±%)", self.labor_tolerance_spin)
         layout.addWidget(labor_box)
 
-        time_box = QGroupBox("Daily windows")
+        time_box = QGroupBox()
+        time_box.setTitle("")
         time_layout = QVBoxLayout(time_box)
         hours_note = QLabel("Set open/close per day. Morning/Evening blocks are derived from these hours plus buffers.")
         hours_note.setWordWrap(True)
@@ -3372,7 +3415,8 @@ class PolicyDialog(QDialog):
         time_layout.addWidget(self.hours_table)
         layout.addWidget(time_box)
 
-        groups_box = QGroupBox("Role-group allocations")
+        groups_box = QGroupBox()
+        groups_box.setTitle("")
         groups_layout = QVBoxLayout(groups_box)
         self.role_group_table = QTableWidget(len(ROLE_GROUPS), 2)
         self.role_group_table.setHorizontalHeaderLabels(["Group", "Allocation %"])
@@ -3691,6 +3735,27 @@ class PolicyDialog(QDialog):
                 continue
             widget.setFocusPolicy(Qt.StrongFocus)
             widget.wheelEvent = lambda event: event.ignore()
+
+    @staticmethod
+    def _make_collapsible(title: str, content: QWidget) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        toggle = QToolButton()
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(True)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.DownArrow)
+
+        def _toggle(checked: bool) -> None:
+            content.setVisible(checked)
+            toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+        toggle.toggled.connect(_toggle)
+        layout.addWidget(toggle)
+        layout.addWidget(content)
+        return container
 
 
 class EmployeeEditDialog(QDialog):
@@ -4904,6 +4969,32 @@ class MainWindow(QMainWindow):
         if app:
             app.closeAllWindows()
         self.close()
+
+    def _refresh_validation_notes(self) -> None:
+        self.validation_list.clear()
+        week_start = self._current_week_start()
+        if not week_start:
+            return
+        with self.session_factory() as session:
+            summary = get_week_summary(session, week_start)
+            shifts = get_shifts_for_week(session, week_start)
+            policy = load_active_policy_spec(self.session_factory)
+        # Day coverage warnings
+        empty_days = [day["date"] for day in summary.get("days", []) if day.get("count", 0) == 0]
+        if empty_days:
+            self.validation_list.addItem(f"No coverage scheduled for: {', '.join(empty_days)}")
+        # Unassigned shift warnings
+        unassigned = [s for s in shifts if not s.get("employee_id")]
+        if unassigned:
+            self.validation_list.addItem(f"{len(unassigned)} unassigned shift(s) remain.")
+        # Wage confirmation warnings
+        missing_wages = validate_wages(role_catalog(policy))
+        if missing_wages:
+            roles_list = ", ".join(sorted(missing_wages.keys()))
+            self.validation_list.addItem(f"Wages missing/unchecked for: {roles_list}")
+        # Budget reminder if labor spend is zero
+        if summary.get("total_cost", 0) <= 0:
+            self.validation_list.addItem("No labor cost recorded yet. Validate after generating schedule.")
 
     def eventFilter(self, source, event) -> bool:
         if event.type() in (
