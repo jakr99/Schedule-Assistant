@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QColor
@@ -402,9 +402,9 @@ class WeekSchedulePage(QWidget):
                 text = self._format_shift_text(shift)
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, shift["id"])
-                color = QColor(palette_for_role(shift.get("role")))
-                item.setBackground(color)
-                item.setForeground(Qt.white)
+                bg_color, fg_color = self._color_for_shift(shift)
+                item.setBackground(bg_color)
+                item.setForeground(fg_color)
                 item.setToolTip(f"{shift.get('role')} \u2014 {shift.get('employee_name') or 'Unassigned'}")
                 if shift["id"] in selected_set:
                     item.setSelected(True)
@@ -462,8 +462,21 @@ class WeekSchedulePage(QWidget):
         notes_line = f"\n{notes}" if notes else ""
         role_name = shift.get("role") or ""
         group = role_group(role_name)
-        group_tag = f" ({group})" if group else ""
-        return f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}\n{employee} · {role_name}{group_tag}{notes_line}"
+        group_line = f"{role_name} [{group}]" if group else role_name
+        return f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}\n{employee}\n{group_line}{notes_line}"
+
+    def _color_for_shift(self, shift: Dict) -> Tuple[QColor, QColor]:
+        base = QColor(palette_for_role(shift.get("role")))
+        key = shift.get("employee_id") or shift.get("employee_name") or shift.get("role") or ""
+        try:
+            seed = hash(key)
+        except Exception:
+            seed = 0
+        tweak = 110 + (abs(seed) % 22)
+        bg = base.lighter(tweak)
+        bg.setAlpha(230)
+        fg = QColor(Qt.white)
+        return bg, fg
 
     def _handle_selection_changed(self) -> None:
         self.selected_shift_ids = self._gather_selected_shift_ids()

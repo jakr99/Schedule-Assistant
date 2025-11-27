@@ -5,6 +5,7 @@ import datetime
 import sys
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -23,6 +24,7 @@ from database import (  # noqa: E402
     get_week_daily_projections,
     shift_display_date,
 )
+from generator.api import generate_schedule_for_week as api_generate_schedule_for_week  # noqa: E402
 from generator.engine import ScheduleGenerator  # noqa: E402
 
 
@@ -208,9 +210,9 @@ class ScheduleGeneratorTests(unittest.TestCase):
 
         monday_shifts = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
         self.assertTrue(monday_shifts)
-        start_times = {shift.start.astimezone().time() for shift in monday_shifts}
-        self.assertEqual(start_times, {datetime.time(22, 0)})
-        end_times = {shift.end.astimezone().time() for shift in monday_shifts}
+        start_times = {shift.start.astimezone().time() for shift in monday_shifts if shift.location.lower() == "close"}
+        self.assertIn(datetime.time(22, 0), start_times)
+        end_times = {shift.end.astimezone().time() for shift in monday_shifts if shift.location.lower() == "close"}
         self.assertIn(datetime.time(22, 35), end_times)
 
     def test_close_block_past_midnight_counts_same_day(self) -> None:
@@ -236,6 +238,53 @@ class ScheduleGeneratorTests(unittest.TestCase):
         end_times = {shift.end.astimezone().time() for shift in monday_closers}
         self.assertIn(datetime.time(0, 35), end_times)
 
+    def test_opener_receives_immediate_follow_up_shift(self) -> None:
+        block_windows = {
+            "Open": ("10:30", "11:00"),
+            "Mid": ("11:00", "16:00"),
+        }
+        roles = ["Server - Dining", "Server - Dining Opener"]
+        policy = self._policy_template(block_windows, roles)
+        policy["roles"]["Server - Dining"]["blocks"]["Mid"].update({"base": 1, "min": 1, "max": 1})
+        policy["roles"]["Server - Dining Opener"]["blocks"]["Open"].update({"base": 1, "min": 1, "max": 1})
+        policy["roles"]["Server - Dining Opener"]["covers"] = ["Server - Dining"]
+        opener = self._add_employee("Dedicated Opener", ["Server - Dining Opener"], desired_hours=40)
+        self._add_employee("Midday Relief", ["Server - Dining"], desired_hours=40)
+
+        self._run_generator(policy)
+
+        monday = self._shifts_for_day(0)
+        open_shift = next(shift for shift in monday if shift.role == "Server - Dining Opener")
+        mid_shift = next(shift for shift in monday if shift.role == "Server - Dining")
+        self.assertEqual(open_shift.employee_id, mid_shift.employee_id)
+        self.assertEqual(open_shift.employee_id, opener.id)
+
+    def test_closer_requires_existing_assignment(self) -> None:
+        block_windows = {
+            "PM": ("12:00", "22:00"),
+            "Close": ("22:00", "22:35"),
+        }
+        roles = ["Server - Dining", "Server - Dining Closer"]
+        policy = self._policy_template(block_windows, roles)
+        policy["roles"]["Server - Dining"]["blocks"]["PM"].update({"base": 1, "min": 1, "max": 1})
+        policy["roles"]["Server - Dining Closer"]["blocks"]["Close"].update({"base": 1, "min": 1, "max": 1})
+        policy["roles"]["Server - Dining Closer"]["covers"] = ["Server - Dining"]
+        closer = self._add_employee("Closer With Shift", ["Server - Dining Closer"], desired_hours=40)
+        self._add_employee(
+            "Closer Without PM",
+            ["Server - Dining Closer"],
+            desired_hours=10,
+            unavailability=[(0, "12:00", "21:45")],
+        )
+
+        self._run_generator(policy)
+
+        monday = self._shifts_for_day(0)
+        pm_shift = next(shift for shift in monday if shift.role == "Server - Dining")
+        close_shift = next(shift for shift in monday if shift.role == "Server - Dining Closer")
+        self.assertEqual(pm_shift.employee_id, close_shift.employee_id)
+        self.assertEqual(close_shift.employee_id, closer.id)
+
     def test_budget_trimmed_before_assignment(self) -> None:
         policy = self._policy(block_names=["Mid"], daily_boost={"Mon": 1})
         policy["roles"]["Server"]["blocks"]["Mid"].update({"base": 3, "min": 1, "max": 3})
@@ -256,6 +305,29 @@ class ScheduleGeneratorTests(unittest.TestCase):
         monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
         self.assertEqual(len(monday), 0, msg="Budget trimming should zero out over-budget coverage before assignment")
         self.assertTrue(result["warnings"] == [] or any("Budget shortfall" in warning for warning in result["warnings"]))
+
+    def test_budget_boost_increases_staffing_when_under_target(self) -> None:
+        policy = self._policy(block_names=["Mid"], daily_boost={"Mon": 1})
+        policy["roles"]["Server"]["blocks"]["Mid"].update({"base": 0, "min": 0, "max": 6})
+        policy["roles"]["Server"]["hourly_wage"] = 25
+        policy["timeblocks"]["Mid"] = {"start": "10:00", "end": "22:00"}
+        policy["global"]["labor_budget_pct"] = 0.5
+        policy["global"]["labor_budget_tolerance_pct"] = 0.25
+        policy["pattern_templates"] = {"Servers": {}}
+        policy["role_groups"] = {
+            "Servers": {"allocation_pct": 1.0, "allow_cuts": True, "cut_buffer_minutes": 30}
+        }
+        self._seed_sales({0: 2000.0})
+        for idx in range(12):
+            self._add_employee(f"Server {idx}", ["Server"], desired_hours=40)
+
+        self._run_generator(policy)
+
+        monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
+        total_cost = sum(shift.labor_cost for shift in monday)
+        self.assertGreaterEqual(len(monday), 3, msg="Budget boost should add extra coverage slots")
+        self.assertGreaterEqual(total_cost, 750.0)
+        self.assertLessEqual(total_cost, 1250.0)
 
     def test_cut_notes_and_end_times_applied_before_insert(self) -> None:
         block_windows = {"Mid": ("10:00", "18:00")}
@@ -420,6 +492,71 @@ class ScheduleGeneratorTests(unittest.TestCase):
     def _time(label: str) -> datetime.time:
         hours, minutes = [int(part) for part in label.split(":", 1)]
         return datetime.time(hour=hours, minute=minutes)
+
+
+class GenerateApiTests(unittest.TestCase):
+    @staticmethod
+    def _session_factory():
+        class _Context:
+            def __enter__(self_inner):
+                return object()
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        return _Context()
+
+    def test_retries_until_summary_contains_shifts(self) -> None:
+        session_factory = self._session_factory
+        with mock.patch("generator.api.load_active_policy", return_value={"global": {}, "roles": {}}), mock.patch(
+            "generator.api.wage_amounts", return_value={}
+        ), mock.patch("generator.api.ScheduleGenerator") as mock_engine:
+            instance = mock_engine.return_value
+            instance.generate.side_effect = [
+                {"shifts_created": 0, "warnings": [], "projected_budget_total": 1000.0, "policy_budget_ratio": 0.0},
+                {
+                    "shifts_created": 4,
+                    "warnings": [],
+                    "projected_budget_total": 1000.0,
+                    "policy_budget_ratio": 0.98,
+                },
+            ]
+            result = api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=3)
+            self.assertEqual(instance.generate.call_count, 2)
+            self.assertEqual(result["shifts_created"], 4)
+            self.assertEqual(result.get("attempts"), 2)
+            self.assertGreaterEqual(result.get("budget_target_ratio", 0.0), 0.75)
+            self.assertEqual(mock_engine.call_args_list[0].kwargs.get("cut_relax_level"), 0)
+            self.assertEqual(mock_engine.call_args_list[1].kwargs.get("cut_relax_level"), 1)
+
+    def test_raises_after_max_attempts(self) -> None:
+        session_factory = self._session_factory
+        with mock.patch("generator.api.load_active_policy", return_value={"global": {}, "roles": {}}), mock.patch(
+            "generator.api.wage_amounts", return_value={}
+        ), mock.patch("generator.api.ScheduleGenerator") as mock_engine:
+            instance = mock_engine.return_value
+            instance.generate.side_effect = RuntimeError("boom")
+            with self.assertRaises(RuntimeError) as context:
+                api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=2)
+            self.assertIn("after 2 attempts", str(context.exception))
+            self.assertEqual(instance.generate.call_count, 2)
+
+    def test_returns_best_summary_when_budget_target_unmet(self) -> None:
+        session_factory = self._session_factory
+        with mock.patch("generator.api.load_active_policy", return_value={"global": {}, "roles": {}}), mock.patch(
+            "generator.api.wage_amounts", return_value={}
+        ), mock.patch("generator.api.ScheduleGenerator") as mock_engine:
+            instance = mock_engine.return_value
+            instance.generate.side_effect = [
+                {"shifts_created": 6, "warnings": [], "projected_budget_total": 1200.0, "policy_budget_ratio": 0.5},
+                {"shifts_created": 8, "warnings": [], "projected_budget_total": 1200.0, "policy_budget_ratio": 0.6},
+                {"shifts_created": 10, "warnings": [], "projected_budget_total": 1200.0, "policy_budget_ratio": 0.7},
+            ]
+            result = api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=3)
+            self.assertEqual(result["shifts_created"], 10)
+            self.assertEqual(result["attempts"], 3)
+            self.assertTrue(any("budget target" in warning.lower() for warning in result.get("warnings", [])))
+            self.assertAlmostEqual(result.get("policy_budget_ratio"), 0.7, places=3)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,26 @@ def load_active_policy(conn) -> Dict:
     if callable(conn):
         with conn() as session:
             policy = get_active_policy(session)
-            return policy.params_dict() if policy else {}
+            return _normalize_policy(policy.params_dict() if policy else {})
     policy = get_active_policy(conn)
-    return policy.params_dict() if policy else {}
+    return _normalize_policy(policy.params_dict() if policy else {})
+
+
+def _normalize_policy(policy: Dict) -> Dict:
+    """Apply lightweight defaults/upgrades so runtime matches code expectations."""
+    if not isinstance(policy, dict):
+        return {}
+    normalized = copy.deepcopy(policy)
+    global_defaults = BASELINE_POLICY.get("global", {})
+    global_cfg = normalized.setdefault("global", {})
+    try:
+        trim_ratio = float(global_cfg.get("trim_aggressive_ratio", global_defaults.get("trim_aggressive_ratio", 1.0)))
+    except (TypeError, ValueError):
+        trim_ratio = global_defaults.get("trim_aggressive_ratio", 1.0)
+    default_trim = global_defaults.get("trim_aggressive_ratio", 1.0)
+    # Ensure trim_aggressive_ratio is at least the code default so budgets are not silently capped.
+    global_cfg["trim_aggressive_ratio"] = max(default_trim, trim_ratio)
+    return normalized
 
 
 def role_catalog(policy: Dict) -> Set[str]:
@@ -284,7 +301,7 @@ def _block_config(
 ) -> Dict[str, float | int | str]:
     minimum = base if min_staff is None else min_staff
     maximum = max(base, minimum) if max_staff is None else max_staff
-    normalized_per_sales = max(0.0, min(per_sales, 0.05))
+    normalized_per_sales = max(0.0, float(per_sales))
     normalized_per_modifier = max(0.0, min(per_modifier, 0.5))
     payload: Dict[str, float | int | str] = {
         "base": max(0, base),
@@ -525,23 +542,24 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Open": _block_config(2, max_staff=3, per_sales=0.2, per_modifier=0.4),
             "Mid": _block_config(
                 2,
-                max_staff=5,
-                per_sales=0.25,
+                max_staff=7,
+                per_sales=0.32,
                 per_modifier=0.4,
-                floor_by_demand=[{"gte": 0.4, "min": 3}, {"gte": 0.7, "min": 4}, {"gte": 1.0, "min": 5}],
+                floor_by_demand=[{"gte": 0.3, "min": 3}, {"gte": 0.6, "min": 4}, {"gte": 0.9, "min": 5}],
             ),
             "PM": _block_config(
                 3,
-                max_staff=5,
-                per_sales=0.3,
+                max_staff=8,
+                per_sales=0.35,
                 per_modifier=0.5,
-                floor_by_demand=[{"gte": 0.4, "min": 3}, {"gte": 0.7, "min": 4}, {"gte": 1.0, "min": 5}],
+                floor_by_demand=[{"gte": 0.3, "min": 4}, {"gte": 0.6, "min": 5}, {"gte": 0.9, "min": 6}],
             ),
             "Close": _block_config(1, max_staff=3, per_sales=0.15, per_modifier=0.3),
         },
         group="Servers",
         cut_buffer_minutes=35,
         covers=["Server - Cocktail", "Server - Patio"],
+        always_on=True,
     ),
     "Server - Cocktail": _role_config(
         wage=6.75,
@@ -563,8 +581,8 @@ ROLES: Dict[str, Dict[str, Any]] = {
             ),
             "PM": _block_config(
                 2,
-                max_staff=3,
-                per_sales=0.2,
+                max_staff=4,
+                per_sales=0.25,
                 per_modifier=0.4,
                 floor_by_demand=[{"gte": 0.3, "min": 1}, {"gte": 0.6, "min": 2}, {"gte": 0.9, "min": 3}],
             ),
@@ -582,7 +600,13 @@ ROLES: Dict[str, Dict[str, Any]] = {
         thresholds=[{"metric": "demand_index", "gte": 0.7, "add": 1}],
         blocks={
             "Mid": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
-            "PM": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
+            "PM": _block_config(
+                1,
+                max_staff=3,
+                per_sales=0.22,
+                per_modifier=0.3,
+                floor_by_demand=[{"gte": 0.7, "min": 2}],
+            ),
         },
         group="Servers",
         cut_buffer_minutes=30,
@@ -645,9 +669,21 @@ ROLES: Dict[str, Dict[str, Any]] = {
         daily_boost={"Sun": -2},
         thresholds=[],
         blocks={
-            "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.01),
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
-            "PM": _block_config(0, min_staff=0, max_staff=1, per_sales=0.03),
+            "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
+            "Mid": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.12,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
+            "PM": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.18,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
             "Close": _block_config(0, min_staff=0, max_staff=0, per_sales=0.0),
         },
         group="Cashier",
@@ -661,8 +697,20 @@ ROLES: Dict[str, Dict[str, Any]] = {
         daily_boost={"Sun": -2},
         thresholds=[],
         blocks={
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
-            "PM": _block_config(0, min_staff=0, max_staff=1, per_sales=0.03),
+            "Mid": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.1,
+                floor_by_demand=[{"gte": 0.5, "min": 1}],
+            ),
+            "PM": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.15,
+                floor_by_demand=[{"gte": 0.5, "min": 1}],
+            ),
             "Close": _block_config(0, min_staff=0, max_staff=0, per_sales=0.0),
         },
         group="Cashier",
@@ -677,7 +725,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
         thresholds=[],
         blocks={
             "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.01),
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.01),
+            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.05),
         },
         group="Cashier",
         cut_buffer_minutes=25,
@@ -699,6 +747,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
         cut_buffer_minutes=25,
         covers=["Prep", "Chip", "Shake"],
         critical=True,
+        allow_cuts=False,
     ),
     "Grill": _role_config(
         wage=18.0,
@@ -708,8 +757,20 @@ ROLES: Dict[str, Dict[str, Any]] = {
         thresholds=[],
         blocks={
             "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.0),
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
-            "PM": _block_config(0, min_staff=0, max_staff=1, per_sales=0.03),
+            "Mid": _block_config(
+                0,
+                min_staff=0,
+                max_staff=3,
+                per_sales=0.06,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
+            "PM": _block_config(
+                0,
+                min_staff=0,
+                max_staff=3,
+                per_sales=0.1,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
             "Close": _block_config(0, min_staff=0, max_staff=0),
         },
         group="Kitchen",
@@ -724,8 +785,20 @@ ROLES: Dict[str, Dict[str, Any]] = {
         thresholds=[],
         blocks={
             "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.0),
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
-            "PM": _block_config(0, min_staff=0, max_staff=1, per_sales=0.03),
+            "Mid": _block_config(
+                0,
+                min_staff=0,
+                max_staff=3,
+                per_sales=0.06,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
+            "PM": _block_config(
+                0,
+                min_staff=0,
+                max_staff=3,
+                per_sales=0.1,
+                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+            ),
             "Close": _block_config(0, min_staff=0, max_staff=0),
         },
         group="Kitchen",
@@ -740,7 +813,13 @@ ROLES: Dict[str, Dict[str, Any]] = {
         thresholds=[],
         blocks={
             "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.0),
-            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
+            "Mid": _block_config(
+                0,
+                min_staff=0,
+                max_staff=2,
+                per_sales=0.04,
+                floor_by_demand=[{"gte": 0.6, "min": 1}],
+            ),
         },
         group="Kitchen",
         cut_buffer_minutes=25,
@@ -753,8 +832,18 @@ ROLES: Dict[str, Dict[str, Any]] = {
         daily_boost={"Sun": -2},
         thresholds=[],
         blocks={
-            "Mid": _block_config(0, max_staff=1, per_sales=0.01),
-            "PM": _block_config(0, max_staff=1, per_sales=0.02),
+            "Mid": _block_config(
+                0,
+                max_staff=2,
+                per_sales=0.04,
+                floor_by_demand=[{"gte": 0.6, "min": 1}],
+            ),
+            "PM": _block_config(
+                0,
+                max_staff=2,
+                per_sales=0.06,
+                floor_by_demand=[{"gte": 0.6, "min": 1}],
+            ),
         },
         group="Kitchen",
         cut_buffer_minutes=25,
@@ -767,8 +856,18 @@ ROLES: Dict[str, Dict[str, Any]] = {
         daily_boost={"Sun": -2},
         thresholds=[],
         blocks={
-            "Mid": _block_config(0, max_staff=1, per_sales=0.01),
-            "PM": _block_config(0, max_staff=1, per_sales=0.02),
+            "Mid": _block_config(
+                0,
+                max_staff=2,
+                per_sales=0.04,
+                floor_by_demand=[{"gte": 0.6, "min": 1}],
+            ),
+            "PM": _block_config(
+                0,
+                max_staff=2,
+                per_sales=0.06,
+                floor_by_demand=[{"gte": 0.6, "min": 1}],
+            ),
         },
         group="Kitchen",
         cut_buffer_minutes=25,
@@ -800,9 +899,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
 
 ROLE_GROUP_ALLOCATIONS: Dict[str, Dict[str, Any]] = {
     "Kitchen": {"allocation_pct": 0.34, "allow_cuts": True, "cut_buffer_minutes": 25},
-    "Servers": {"allocation_pct": 0.4, "allow_cuts": True, "cut_buffer_minutes": 35},
+    "Servers": {"allocation_pct": 0.39, "allow_cuts": True, "cut_buffer_minutes": 35},
     "Bartenders": {"allocation_pct": 0.12, "allow_cuts": False, "always_on": True, "cut_buffer_minutes": 0},
-    "Cashier": {"allocation_pct": 0.14, "allow_cuts": True, "cut_buffer_minutes": 25},
+    "Cashier": {"allocation_pct": 0.15, "allow_cuts": True, "cut_buffer_minutes": 25},
 }
 
 ANCHOR_RULES: Dict[str, Any] = {
@@ -848,7 +947,7 @@ BASELINE_POLICY: Dict[str, Any] = {
         "close_buffer_minutes": 35,
         "labor_budget_pct": 0.27,
         "labor_budget_tolerance_pct": 0.08,
-        "trim_aggressive_ratio": 0.7,
+        "trim_aggressive_ratio": 1.0,
     },
     "timeblocks": DEFAULT_TIMEBLOCKS,
     "business_hours": BUSINESS_HOURS,
