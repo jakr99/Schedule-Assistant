@@ -20,6 +20,7 @@ from database import (
     get_week_modifiers,
     save_week_daily_projection_values,
     set_week_status,
+    save_employee_role_wages,
 )
 from exporter import DATA_DIR as EXPORT_DIR
 from roles import defined_roles
@@ -47,9 +48,9 @@ def _week_info_from_date(week_start: datetime.date) -> Dict[str, int | str]:
 # Employee import/export
 
 
-def export_employees(session) -> Path:
+def export_employees(employee_session) -> Path:
     payload: List[Dict] = []
-    employees = session.scalars(select(Employee).order_by(Employee.full_name.asc())).all()
+    employees = employee_session.scalars(select(Employee).order_by(Employee.full_name.asc())).all()
     for employee in employees:
         entry = {
             "full_name": employee.full_name,
@@ -59,6 +60,10 @@ def export_employees(session) -> Path:
             "start_month": employee.start_month,
             "start_year": employee.start_year,
             "roles": employee.role_list,
+            "role_wages": [
+                {"role": wage.role, "wage": wage.wage, "confirmed": bool(getattr(wage, "confirmed", False))}
+                for wage in getattr(employee, "role_wages", []) or []
+            ],
             "unavailability": [
                 {
                     "day_of_week": row.day_of_week,
@@ -77,7 +82,7 @@ def export_employees(session) -> Path:
     return filename
 
 
-def import_employees(session, file_path: Path) -> Tuple[int, int]:
+def import_employees(employee_session, file_path: Path) -> Tuple[int, int]:
     data = json.loads(file_path.read_text(encoding="utf-8"))
     employees = data.get("employees", [])
     created = 0
@@ -90,11 +95,11 @@ def import_employees(session, file_path: Path) -> Tuple[int, int]:
         if not roles:
             continue
         stmt = select(Employee).where(Employee.full_name == name)
-        employee = session.scalars(stmt).first()
+        employee = employee_session.scalars(stmt).first()
         if not employee:
             employee = Employee(full_name=name)
-            session.add(employee)
-            session.flush()
+            employee_session.add(employee)
+            employee_session.flush()
             created += 1
         else:
             updated += 1
@@ -106,7 +111,9 @@ def import_employees(session, file_path: Path) -> Tuple[int, int]:
         employee.start_year = payload.get("start_year")
 
         # Replace unavailability rows
-        session.execute(delete(EmployeeUnavailability).where(EmployeeUnavailability.employee_id == employee.id))
+        employee_session.execute(
+            delete(EmployeeUnavailability).where(EmployeeUnavailability.employee_id == employee.id)
+        )
         for entry in payload.get("unavailability", []):
             try:
                 start_time = datetime.time.fromisoformat(entry["start_time"])
@@ -114,7 +121,7 @@ def import_employees(session, file_path: Path) -> Tuple[int, int]:
                 day = int(entry["day_of_week"])
             except (KeyError, ValueError):
                 continue
-            session.add(
+            employee_session.add(
                 EmployeeUnavailability(
                     employee_id=employee.id,
                     day_of_week=day,
@@ -122,7 +129,13 @@ def import_employees(session, file_path: Path) -> Tuple[int, int]:
                     end_time=end_time,
                 )
             )
-    session.commit()
+        role_wage_map = {
+            entry["role"]: entry.get("wage", 0.0)
+            for entry in payload.get("role_wages", [])
+            if isinstance(entry, dict) and entry.get("role")
+        }
+        save_employee_role_wages(employee_session, employee.id, role_wage_map)
+    employee_session.commit()
     return created, updated
 
 
@@ -216,9 +229,12 @@ def import_week_modifiers(session, week: WeekContext, file_path: Path, *, create
 # Week schedule (shifts)
 
 
-def export_week_schedule(session, week_start: datetime.date) -> Path:
+def export_week_schedule(session, week_start: datetime.date, *, employee_session=None) -> Path:
     week = get_or_create_week(session, week_start)
     shifts = session.scalars(select(Shift).where(Shift.week_id == week.id)).all()
+    employees: Dict[int, str] = {}
+    if employee_session:
+        employees = {emp.id: emp.full_name for emp in employee_session.scalars(select(Employee))}
     payload = [
         {
             "role": shift.role,
@@ -229,7 +245,7 @@ def export_week_schedule(session, week_start: datetime.date) -> Path:
             "status": shift.status,
             "labor_rate": shift.labor_rate,
             "labor_cost": shift.labor_cost,
-            "employee_name": shift.employee.full_name if shift.employee else None,
+            "employee_name": employees.get(shift.employee_id),
         }
         for shift in shifts
     ]
@@ -241,14 +257,16 @@ def export_week_schedule(session, week_start: datetime.date) -> Path:
     return filename
 
 
-def import_week_schedule(session, week_start: datetime.date, file_path: Path) -> int:
+def import_week_schedule(session, week_start: datetime.date, file_path: Path, *, employee_session=None) -> int:
     data = json.loads(file_path.read_text(encoding="utf-8"))
     week = get_or_create_week(session, week_start)
     session.execute(delete(Shift).where(Shift.week_id == week.id))
-    name_to_id = {
-        employee.full_name: employee.id
-        for employee in session.scalars(select(Employee)).all()
-    }
+    name_to_id: Dict[str, int] = {}
+    if employee_session:
+        name_to_id = {
+            employee.full_name: employee.id
+            for employee in employee_session.scalars(select(Employee)).all()
+        }
     added = 0
     for entry in data.get("shifts", []):
         try:
@@ -296,7 +314,15 @@ def import_role_wages_dataset(file_path: Path) -> int:
 # Copy helpers (no files)
 
 
-def copy_week_dataset(session, source_week: WeekContext, target_week: WeekContext, dataset: str, *, actor: str) -> Dict[str, int]:
+def copy_week_dataset(
+    session,
+    source_week: WeekContext,
+    target_week: WeekContext,
+    dataset: str,
+    *,
+    actor: str,
+    employee_session=None,
+) -> Dict[str, int]:
     """Copy projections/modifiers/shifts between weeks. Returns summary counts."""
     dataset = dataset.lower()
     if dataset == "projections":
@@ -335,6 +361,12 @@ def copy_week_dataset(session, source_week: WeekContext, target_week: WeekContex
         target_date = datetime.date.fromisocalendar(target_week.iso_year, target_week.iso_week, 1)
         source_date = datetime.date.fromisocalendar(source_week.iso_year, source_week.iso_week, 1)
         export_path = EXPORT_DIR / f"temp_copy_{_timestamp()}.json"
+        employees: Dict[int, str] = {}
+        if employee_session:
+            employees = {
+                employee.id: employee.full_name
+                for employee in employee_session.scalars(select(Employee))
+            }
         export_path.write_text(
             json.dumps({
                 "week": _week_info_from_date(source_date),
@@ -348,14 +380,14 @@ def copy_week_dataset(session, source_week: WeekContext, target_week: WeekContex
                         "status": shift.status,
                         "labor_rate": shift.labor_rate,
                         "labor_cost": shift.labor_cost,
-                        "employee_name": shift.employee.full_name if shift.employee else None,
+                        "employee_name": employees.get(shift.employee_id),
                     }
                     for shift in session.scalars(select(Shift).where(Shift.week_id == source_week.id))
                 ],
             }),
             encoding="utf-8",
         )
-        count = import_week_schedule(session, target_date, export_path)
+        count = import_week_schedule(session, target_date, export_path, employee_session=employee_session)
         export_path.unlink(missing_ok=True)
         return {"shifts": count}
     raise ValueError(f"Unsupported dataset '{dataset}' for copy operation.")

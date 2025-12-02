@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import calendar
+import copy
 import datetime
 import hashlib
 import json
@@ -13,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
-from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator
+from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -38,6 +39,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QScrollArea,
+    QTabWidget,
+    QToolButton,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -57,6 +60,7 @@ from database import (
     Policy,
     SavedModifier,
     SessionLocal,
+    EmployeeSessionLocal,
     WeekContext,
     WeekDailyProjection,
     apply_saved_modifier_to_week,
@@ -71,8 +75,10 @@ from database import (
     get_week_summary,
     init_database,
     list_saved_modifiers,
+    get_employee_role_wages,
     save_week_daily_projection_values,
     save_modifier_template,
+    save_employee_role_wages,
     set_week_status,
     upsert_policy,
 )
@@ -92,7 +98,7 @@ from data_exchange import (
     import_week_projections,
     import_week_schedule,
 )
-from policy import build_default_policy, ensure_default_policy, role_catalog
+from policy import CUT_PRIORITY_DEFAULT, build_default_policy, ensure_default_policy, role_catalog
 from wages import (
     baseline_wages,
     export_wages as export_wages_file,
@@ -101,8 +107,9 @@ from wages import (
     reset_wages_to_defaults,
     save_wages,
     validate_wages,
+    ALLOW_ZERO_ROLES,
 )
-from roles import ROLE_GROUPS, role_group
+from roles import ROLE_GROUPS, role_group, normalize_role
 from ui.week_view import WeekSchedulePage
 
 
@@ -187,16 +194,22 @@ EMPLOYEE_ROLE_GROUPS = {
         "Bartender",
         "Bartender - Opener",
         "Bartender - Closer",
+        "Bartender - Training",
     ],
     "Cashier / Guest Services": [
         "Cashier",
-        "Cashier - To-Go Specialist",
+        "Cashier - To-Go",
+        "Cashier - Host",
+        "Cashier - Training",
+        "Cashier - All Roles",
     ],
     "Servers - Dining": [
         "Server - Dining",
         "Server - Dining Opener",
         "Server - Dining Preclose",
         "Server - Dining Closer",
+        "Server - Training",
+        "Server - All Roles",
         "Server - Patio",
     ],
     "Servers - Cocktail": [
@@ -206,12 +219,22 @@ EMPLOYEE_ROLE_GROUPS = {
         "Server - Cocktail Closer",
     ],
     "Kitchen": [
-        "Kitchen Opener",
-        "Kitchen Closer",
-        "Expo",
-        "Grill",
-        "Chip",
-        "Shake",
+        "HOH - Opener",
+        "HOH - Closer",
+        "HOH - Training",
+        "HOH - All Roles",
+        "HOH - Kit",
+        "HOH - Expo",
+        "HOH - Grill",
+        "HOH - Southwest",
+        "HOH - Chip",
+        "HOH - Shake",
+        "HOH - Prep",
+        "HOH - Cook",
+    ],
+    "Management": [
+        "Shift Lead",
+        "MGR - FOH",
     ],
 }
 EMPLOYEE_ROLE_OPTIONS = [role for group in EMPLOYEE_ROLE_GROUPS.values() for role in group]
@@ -1125,6 +1148,7 @@ class ValidationImportExportPage(QWidget):
     def __init__(
         self,
         session_factory,
+        employee_session_factory,
         user: Dict[str, Any],
         active_week: Dict[str, Any],
         *,
@@ -1133,6 +1157,7 @@ class ValidationImportExportPage(QWidget):
     ) -> None:
         super().__init__()
         self.session_factory = session_factory
+        self.employee_session_factory = employee_session_factory
         self.user = user
         self.active_week = active_week
         self.on_week_changed = on_week_changed
@@ -1465,13 +1490,21 @@ class ValidationImportExportPage(QWidget):
             if not source_week or not target_week:
                 self._set_feedback("Unable to resolve the requested weeks.", ERROR_COLOR)
                 return
-            summary = copy_week_dataset(
-                session,
-                source_week,
-                target_week,
-                dataset,
-                actor=self.user.get("username", "unknown"),
-            )
+            employee_session = None
+            try:
+                if dataset == "shifts":
+                    employee_session = self.employee_session_factory()
+                summary = copy_week_dataset(
+                    session,
+                    source_week,
+                    target_week,
+                    dataset,
+                    actor=self.user.get("username", "unknown"),
+                    employee_session=employee_session,
+                )
+            finally:
+                if employee_session:
+                    employee_session.close()
         recap = ", ".join(f"{k}={v}" for k, v in summary.items())
         self._set_feedback(f"Copied {dataset} from {selection} ({recap}).", SUCCESS_COLOR)
         self.results_list.addItem(f"Copied {dataset} from {selection} -> {self.active_week.get('label')}")
@@ -1526,9 +1559,10 @@ class ValidationImportExportPage(QWidget):
     def _export_dataset(self, dataset: str) -> Optional[Path]:
         if dataset == "wages":
             return export_role_wages_dataset()
+        if dataset == "employees":
+            with self.employee_session_factory() as employee_session:
+                return export_employees(employee_session)
         with self.session_factory() as session:
-            if dataset == "employees":
-                return export_employees(session)
             week = self._get_week_context(session)
             if not week:
                 raise ValueError("Select a week first.")
@@ -1540,17 +1574,19 @@ class ValidationImportExportPage(QWidget):
                 week_start = self._current_week_start()
                 if not week_start:
                     raise ValueError("Select a week first.")
-                return export_week_schedule(session, week_start)
+                with self.employee_session_factory() as employee_session:
+                    return export_week_schedule(session, week_start, employee_session=employee_session)
         return None
 
     def _import_dataset(self, dataset: str, path: Path) -> Dict[str, int]:
         if dataset == "wages":
             count = import_role_wages_dataset(path)
             return {"roles": count}
-        with self.session_factory() as session:
-            if dataset == "employees":
-                created, updated = import_employees(session, path)
+        if dataset == "employees":
+            with self.employee_session_factory() as employee_session:
+                created, updated = import_employees(employee_session, path)
                 return {"created": created, "updated": updated}
+        with self.session_factory() as session:
             week = self._get_week_context(session)
             if not week:
                 raise ValueError("Select a week first.")
@@ -1564,7 +1600,8 @@ class ValidationImportExportPage(QWidget):
                 week_start = self._current_week_start()
                 if not week_start:
                     raise ValueError("Select a week first.")
-                count = import_week_schedule(session, week_start, path)
+                with self.employee_session_factory() as employee_session:
+                    count = import_week_schedule(session, week_start, path, employee_session=employee_session)
                 return {"shifts": count}
         raise ValueError(f"Unsupported dataset '{dataset}'")
 
@@ -2574,6 +2611,539 @@ def _default_business_hours() -> Dict[str, Dict[str, str]]:
     }
 
 
+class RoleSelectionDialog(QDialog):
+    def __init__(self, group: str, roles: List[str], selected: List[str]) -> None:
+        super().__init__()
+        self.setWindowTitle(f"Select roles for {group}")
+        self.resize(360, 420)
+        layout = QVBoxLayout(self)
+        info = QLabel("Check the roles to include.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+        for role in roles:
+            item = QListWidgetItem(role)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if role in selected else Qt.Unchecked)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_roles(self) -> List[str]:
+        roles: List[str] = []
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            if item.checkState() == Qt.Checked:
+                roles.append(item.text())
+        return roles
+
+
+class RoleSelectField(QWidget):
+    """Field that shows selected roles and opens a dialog for selection."""
+
+    def __init__(self, group: str, available: List[str], selected: List[str]) -> None:
+        super().__init__()
+        self.group = group
+        self.available_roles = available
+        self._selected_roles = selected or []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.NoSelection)
+        self.list_widget.setFocusPolicy(Qt.NoFocus)
+        self.list_widget.setMinimumHeight(180)
+        self.list_widget.setStyleSheet(
+            "QListWidget {background-color:#1f1f1f; border:1px solid #979797; font-size:13px;}"
+            "QListWidget::item {padding:6px; margin:3px; border-radius:6px; background-color:#2a2a2a; color:#f7f7f7;}"
+        )
+        layout.addWidget(self.list_widget)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 4, 0, 0)
+        button_row.setSpacing(8)
+        self.pick_btn = QPushButton("Select roles")
+        self.pick_btn.setMinimumWidth(110)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setMaximumWidth(80)
+        self.pick_btn.clicked.connect(self._open_picker)
+        self.clear_btn.clicked.connect(self._clear_roles)
+        button_row.addWidget(self.pick_btn)
+        button_row.addWidget(self.clear_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        self._refresh_display()
+
+    def selected_roles(self) -> List[str]:
+        return list(self._selected_roles)
+
+    def set_group(self, group: str, roles: List[str]) -> None:
+        self.group = group
+        self.available_roles = roles
+        if not self._selected_roles:
+            self._selected_roles = roles[:]
+        else:
+            self._selected_roles = [role for role in self._selected_roles if role in roles] or roles[:]
+        self._refresh_display()
+
+    def set_selected_roles(self, roles: List[str]) -> None:
+        filtered = [role for role in roles if role in self.available_roles]
+        self._selected_roles = filtered or []
+        self._refresh_display()
+
+    def set_available_roles(self, roles: List[str]) -> None:
+        self.available_roles = roles
+        self._selected_roles = [role for role in self._selected_roles if role in roles]
+        self._refresh_display()
+
+    def _open_picker(self) -> None:
+        dialog = RoleSelectionDialog(self.group or "Group", self.available_roles, self._selected_roles)
+        if dialog.exec() == QDialog.Accepted:
+            self._selected_roles = dialog.selected_roles()
+            self._refresh_display()
+
+    def _clear_roles(self) -> None:
+        self._selected_roles = []
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        self.list_widget.clear()
+        roles = self._selected_roles or []
+        if not roles:
+            placeholder = QListWidgetItem("(none selected)")
+            placeholder.setFlags(Qt.NoItemFlags)
+            placeholder_font = QFont()
+            placeholder_font.setItalic(True)
+            placeholder.setFont(placeholder_font)
+            self.list_widget.addItem(placeholder)
+            return
+        for role in roles:
+            item = QListWidgetItem(role)
+            item.setFlags(Qt.NoItemFlags)
+            self.list_widget.addItem(item)
+
+
+class ShiftTemplateEditor(QWidget):
+    """UI widget for editing AM/PM shift suggestions."""
+
+    def __init__(self, groups: List[str]) -> None:
+        super().__init__()
+        self.groups = groups
+        self.tables: Dict[str, Dict[str, QTableWidget]] = {}
+        layout = QVBoxLayout(self)
+        intro = QLabel("Suggested shift windows; generator prefers these start times when possible.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{INFO_COLOR}; font-weight:500;")
+        layout.addWidget(intro)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        for group in groups:
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            block_tables: Dict[str, QTableWidget] = {}
+            for block_key, label in (("am", "Morning (AM)"), ("pm", "Evening (PM)")):
+                section = QGroupBox(f"{label} shifts")
+                section_layout = QVBoxLayout(section)
+                table = self._build_table()
+                block_tables[block_key] = table
+                section_layout.addWidget(table)
+                buttons = QHBoxLayout()
+                add_btn = QPushButton("Add row")
+                remove_btn = QPushButton("Remove selected")
+                add_btn.clicked.connect(lambda _=None, tbl=table: self._append_row(tbl))
+                remove_btn.clicked.connect(lambda _=None, tbl=table: self._remove_row(tbl))
+                buttons.addWidget(add_btn)
+                buttons.addWidget(remove_btn)
+                buttons.addStretch(1)
+                section_layout.addLayout(buttons)
+                tab_layout.addWidget(section)
+            tab_layout.addStretch(1)
+            self.tabs.addTab(tab, group)
+            self.tables[group] = block_tables
+
+    @staticmethod
+    def _build_table() -> QTableWidget:
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Start", "End"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        return table
+
+    def _append_row(self, table: QTableWidget, start: str = "11:00", end: str = "15:00") -> None:
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(start))
+        table.setItem(row, 1, QTableWidgetItem(end))
+
+    @staticmethod
+    def _remove_row(table: QTableWidget) -> None:
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+
+    def set_config(self, config: Dict[str, Any]) -> None:
+        config = config or {}
+        for group, blocks in self.tables.items():
+            group_spec = config.get(group, {})
+            for block_key, table in blocks.items():
+                table.setRowCount(0)
+                entries = group_spec.get(block_key) or []
+                if isinstance(entries, list) and entries:
+                    for entry in entries:
+                        start = str(entry.get("start", "11:00"))
+                        end = str(entry.get("end", "15:00"))
+                        self._append_row(table, start, end)
+                if table.rowCount() == 0:
+                    self._append_row(table)
+
+    def value(self) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
+        payload: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+        for group, blocks in self.tables.items():
+            block_payload: Dict[str, List[Dict[str, str]]] = {}
+            for block_key, table in blocks.items():
+                entries: List[Dict[str, str]] = []
+                for row in range(table.rowCount()):
+                    start_item = table.item(row, 0)
+                    end_item = table.item(row, 1)
+                    start = (start_item.text() if start_item else "").strip()
+                    end = (end_item.text() if end_item else "").strip()
+                    if start and end:
+                        entries.append({"start": start, "end": end})
+                if entries:
+                    block_payload[block_key] = entries
+            if block_payload:
+                payload[group] = block_payload
+        return payload
+
+
+class SectionCapacityEditor(QWidget):
+    """UI widget for editing section capacity weights that influence cut bias."""
+
+    def __init__(self, group_sections: Dict[str, List[str]]) -> None:
+        super().__init__()
+        self.group_sections = group_sections
+        self.inputs: Dict[str, Dict[str, QDoubleSpinBox]] = {}
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Capacities bias how long sections stay. Higher weight delays cuts; lower weight cuts sooner."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{INFO_COLOR}; font-weight:500;")
+        layout.addWidget(intro)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        for group, sections in group_sections.items():
+            tab = QWidget()
+            tab_layout = QFormLayout(tab)
+            group_inputs: Dict[str, QDoubleSpinBox] = {}
+            for section_name in sections:
+                spin = QDoubleSpinBox()
+                spin.setRange(0.2, 3.0)
+                spin.setSingleStep(0.1)
+                spin.setValue(1.0)
+                spin.setSuffix("x")
+                tab_layout.addRow(section_name, spin)
+                group_inputs[section_name] = spin
+            self.tabs.addTab(tab, group)
+            self.inputs[group] = group_inputs
+
+    def set_config(self, config: Dict[str, Any]) -> None:
+        for group, sections in self.inputs.items():
+            group_cfg = (config or {}).get(group, {})
+            for section_name, spin in sections.items():
+                spin.setValue(float(group_cfg.get(section_name, 1.0)))
+
+    def value(self) -> Dict[str, Dict[str, float]]:
+        payload: Dict[str, Dict[str, float]] = {}
+        for group, sections in self.inputs.items():
+            payload[group] = {section: round(spin.value(), 2) for section, spin in sections.items()}
+        return payload
+
+
+class CutPriorityEditor(QWidget):
+    """Shared widget that manages cut sequencing + role ordering settings."""
+
+    TOGGLE_STYLE = (
+        "QPushButton {border-radius:12px; padding:6px 14px; font-weight:600; border:1px solid #4a4a4a;}"
+        "QPushButton:checked {background-color:#2e7d32; color:white; border-color:#2e7d32;}"
+        "QPushButton:!checked {background-color:#5c2f31; color:white; border-color:#5c2f31;}"
+    )
+
+    TABLE_STYLE = (
+        "QTableWidget {background-color:#161616; color:#f2f2f2; gridline-color:#2d2d2d;}"
+        "QTableWidget::item:selected {background-color:#314b6e; color:white;}"
+        "QHeaderView::section {background-color:#1d1d1d; color:#f2f2f2; border:0; padding:4px;}"
+        "QLineEdit, QComboBox {background-color:#232323; color:#fdfdfd; border:1px solid #555; padding:4px;}"
+        "QComboBox QAbstractItemView {background-color:#232323; color:#fdfdfd;}"
+    )
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.available_groups = sorted(list(ROLE_GROUPS.keys()) + ["Other"])
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Optional: enable alternating cut rotations to cycle groups evenly and specify preferred role order."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{INFO_COLOR}; font-weight:500;")
+        layout.addWidget(intro)
+
+        toggle_row = QHBoxLayout()
+        self.enabled_toggle = QPushButton("Rotation disabled")
+        self.enabled_toggle.setCheckable(True)
+        self.enabled_toggle.setStyleSheet(self.TOGGLE_STYLE)
+        self.include_unlisted_toggle = QPushButton("Append unlisted groups")
+        self.include_unlisted_toggle.setCheckable(True)
+        self.include_unlisted_toggle.setChecked(True)
+        self.include_unlisted_toggle.setStyleSheet(self.TOGGLE_STYLE)
+        self.status_badge = QLabel()
+        self.status_badge.setAlignment(Qt.AlignCenter)
+        self.status_badge.setFixedWidth(130)
+        self.status_badge.setStyleSheet("padding:4px 10px; border-radius:12px; font-weight:700;")
+        toggle_row.addWidget(self.enabled_toggle)
+        toggle_row.addWidget(self.include_unlisted_toggle)
+        toggle_row.addWidget(self.status_badge)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
+
+        self.config_frame = QGroupBox("Rotation + role ordering")
+        config_layout = QVBoxLayout(self.config_frame)
+
+        self.editor_tabs = QTabWidget()
+        self.editor_tabs.setTabPosition(QTabWidget.North)
+        config_layout.addWidget(self.editor_tabs)
+
+        # Rotation tab
+        rotation_widget = QWidget()
+        rotation_layout = QVBoxLayout(rotation_widget)
+        self.sequence_table = QTableWidget(0, 2)
+        self.sequence_table.setHorizontalHeaderLabels(["Group", "Role filters"])
+        self.sequence_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sequence_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.sequence_table.horizontalHeader().setStretchLastSection(True)
+        self.sequence_table.verticalHeader().setVisible(True)
+        self.sequence_table.verticalHeader().setDefaultSectionSize(195)
+        self.sequence_table.setStyleSheet(self.TABLE_STYLE + "font-size:13px;")
+        rotation_layout.addWidget(self.sequence_table)
+        seq_controls = QHBoxLayout()
+        self.sequence_add_btn = QPushButton("Add rotation row")
+        self.sequence_remove_btn = QPushButton("Remove selected")
+        self.sequence_up_btn = QPushButton("Move up")
+        self.sequence_down_btn = QPushButton("Move down")
+        self.sequence_add_btn.clicked.connect(self._handle_sequence_add)
+        self.sequence_remove_btn.clicked.connect(lambda: self._handle_sequence_remove(self.sequence_table))
+        self.sequence_up_btn.clicked.connect(lambda: self._handle_sequence_move(self.sequence_table, -1))
+        self.sequence_down_btn.clicked.connect(lambda: self._handle_sequence_move(self.sequence_table, 1))
+        for btn in (self.sequence_add_btn, self.sequence_remove_btn, self.sequence_up_btn, self.sequence_down_btn):
+            seq_controls.addWidget(btn)
+        seq_controls.addStretch(1)
+        rotation_layout.addLayout(seq_controls)
+        self.editor_tabs.addTab(rotation_widget, "Rotation sequence")
+
+        # Role order tab
+        order_widget = QWidget()
+        order_layout = QVBoxLayout(order_widget)
+        self.role_order_table = QTableWidget(0, 2)
+        self.role_order_table.setHorizontalHeaderLabels(["Group", "Preferred role order"])
+        self.role_order_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.role_order_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.role_order_table.horizontalHeader().setStretchLastSection(True)
+        self.role_order_table.verticalHeader().setVisible(True)
+        self.role_order_table.verticalHeader().setDefaultSectionSize(195)
+        self.role_order_table.setStyleSheet(self.TABLE_STYLE + "font-size:13px;")
+        order_layout.addWidget(self.role_order_table)
+        role_controls = QHBoxLayout()
+        self.role_add_btn = QPushButton("Add preference")
+        self.role_remove_btn = QPushButton("Remove selected")
+        self.role_add_btn.clicked.connect(self._handle_role_add)
+        self.role_remove_btn.clicked.connect(lambda: self._handle_sequence_remove(self.role_order_table))
+        role_controls.addWidget(self.role_add_btn)
+        role_controls.addWidget(self.role_remove_btn)
+        role_controls.addStretch(1)
+        order_layout.addLayout(role_controls)
+        self.editor_tabs.addTab(order_widget, "Role ordering")
+
+        layout.addWidget(self.config_frame)
+        layout.addStretch(1)
+
+        self.enabled_toggle.toggled.connect(self._update_enabled_state)
+        self.include_unlisted_toggle.toggled.connect(
+            lambda _: self._style_toggle(self.include_unlisted_toggle, "Append unlisted groups")
+        )
+
+    def set_config(self, config: Optional[Dict[str, Any]]) -> None:
+        spec = copy.deepcopy(config) if isinstance(config, dict) else {}
+        if not spec:
+            spec = copy.deepcopy(CUT_PRIORITY_DEFAULT)
+        self.enabled_toggle.setChecked(bool(spec.get("enabled", False)))
+        self.include_unlisted_toggle.setChecked(bool(spec.get("include_unlisted", True)))
+        sequence = spec.get("sequence") or copy.deepcopy(CUT_PRIORITY_DEFAULT.get("sequence", []))
+        self._load_sequence_rows(sequence)
+        role_order = spec.get("role_order") or copy.deepcopy(CUT_PRIORITY_DEFAULT.get("role_order", {}))
+        self._load_role_order(role_order)
+        self._update_enabled_state()
+
+    def value(self) -> Dict[str, Any]:
+        sequence: List[Dict[str, Any]] = []
+        for row in range(self.sequence_table.rowCount()):
+            combo = self.sequence_table.cellWidget(row, 0)
+            selector = self.sequence_table.cellWidget(row, 1)
+            if not isinstance(combo, QComboBox) or not isinstance(selector, RoleSelectField):
+                continue
+            group = combo.currentText().strip()
+            if not group:
+                continue
+            roles_raw = selector.selected_roles()
+            sequence.append({"group": group, "roles": roles_raw})
+        role_order: Dict[str, List[str]] = {}
+        for row in range(self.role_order_table.rowCount()):
+            combo = self.role_order_table.cellWidget(row, 0)
+            selector = self.role_order_table.cellWidget(row, 1)
+            if not isinstance(combo, QComboBox) or not isinstance(selector, RoleSelectField):
+                continue
+            group = combo.currentText().strip()
+            if not group:
+                continue
+            entries = selector.selected_roles()
+            if entries:
+                role_order[group] = entries
+        return {
+            "enabled": self.enabled_toggle.isChecked(),
+            "include_unlisted": self.include_unlisted_toggle.isChecked(),
+            "sequence": sequence,
+            "role_order": role_order,
+        }
+
+    def set_read_only(self, read_only: bool) -> None:
+        for widget in [
+            self.enabled_toggle,
+            self.include_unlisted_toggle,
+            self.sequence_table,
+            self.role_order_table,
+            self.sequence_add_btn,
+            self.sequence_remove_btn,
+            self.sequence_up_btn,
+            self.sequence_down_btn,
+            self.role_add_btn,
+            self.role_remove_btn,
+        ]:
+            widget.setEnabled(not read_only)
+
+    def _update_enabled_state(self) -> None:
+        enabled = self.enabled_toggle.isChecked()
+        self._style_toggle(self.enabled_toggle, "Rotation enabled" if enabled else "Rotation disabled")
+        self.config_frame.setVisible(enabled)
+        self.status_badge.setText("ENABLED" if enabled else "DISABLED")
+        color = "#2e7d32" if enabled else "#6c2f2f"
+        self.status_badge.setStyleSheet(
+            f"padding:4px; border-radius:6px; font-weight:600; color:white; background-color:{color};"
+        )
+        if enabled and self.sequence_table.rowCount() == 0:
+            self._load_sequence_rows(CUT_PRIORITY_DEFAULT.get("sequence", []))
+        if enabled and self.role_order_table.rowCount() == 0:
+            self._load_role_order(CUT_PRIORITY_DEFAULT.get("role_order", {}))
+        self.include_unlisted_toggle.setEnabled(enabled)
+        self._style_toggle(self.include_unlisted_toggle, "Append unlisted groups")
+
+    def _style_toggle(self, button: QPushButton, label: str) -> None:
+        if button.isChecked():
+            button.setText(label + " (On)")
+        else:
+            button.setText(label + " (Off)")
+
+    @staticmethod
+    def _roles_for_group(group: str) -> List[str]:
+        for name, roles in ROLE_GROUPS.items():
+            if name.lower() == (group or "").strip().lower():
+                return roles[:]
+        return []
+
+    def _handle_sequence_add(self) -> None:
+        self._add_sequence_row(self.available_groups[0] if self.available_groups else "", [])
+
+    def _handle_sequence_remove(self, table: QTableWidget) -> None:
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+
+    def _handle_sequence_move(self, table: QTableWidget, delta: int) -> None:
+        row = table.currentRow()
+        if row < 0:
+            return
+        target = row + delta
+        if target < 0 or target >= table.rowCount():
+            return
+        for col in range(table.columnCount()):
+            current_widget = table.cellWidget(row, col)
+            target_widget = table.cellWidget(target, col)
+            table.setCellWidget(row, col, target_widget)
+            table.setCellWidget(target, col, current_widget)
+        table.setCurrentCell(target, 0)
+
+    def _handle_role_add(self) -> None:
+        self._add_role_row(self.available_groups[0] if self.available_groups else "", [])
+
+    def _load_sequence_rows(self, rows: List[Dict[str, Any]]) -> None:
+        self.sequence_table.setRowCount(0)
+        for entry in rows:
+            group = entry.get("group", "")
+            roles = entry.get("roles") or []
+            self._add_sequence_row(group, roles)
+
+    def _load_role_order(self, mapping: Dict[str, List[str]]) -> None:
+        self.role_order_table.setRowCount(0)
+        for group, roles in mapping.items():
+            self._add_role_row(group, roles)
+
+    def _add_sequence_row(self, group: str, roles: Iterable[str]) -> None:
+        row = self.sequence_table.rowCount()
+        self.sequence_table.insertRow(row)
+        group_combo = self._group_combo(group)
+        available_roles = self._roles_for_group(group_combo.currentText())
+        selected_roles = list(roles) if roles else available_roles[:]
+        field = RoleSelectField(group_combo.currentText(), available_roles, selected_roles)
+
+        def handle_group_change(value: str, selector: RoleSelectField = field) -> None:
+            selector.set_group(value, self._roles_for_group(value))
+
+        group_combo.currentTextChanged.connect(handle_group_change)
+        self.sequence_table.setCellWidget(row, 0, group_combo)
+        self.sequence_table.setCellWidget(row, 1, field)
+
+    def _add_role_row(self, group: str, roles: Iterable[str]) -> None:
+        row = self.role_order_table.rowCount()
+        self.role_order_table.insertRow(row)
+        group_combo = self._group_combo(group)
+        available_roles = self._roles_for_group(group_combo.currentText())
+        selected_roles = list(roles) if roles else available_roles[:]
+        field = RoleSelectField(group_combo.currentText(), available_roles, selected_roles)
+
+        def handle_group_change(value: str, selector: RoleSelectField = field) -> None:
+            selector.set_group(value, self._roles_for_group(value))
+
+        group_combo.currentTextChanged.connect(handle_group_change)
+        self.role_order_table.setCellWidget(row, 0, group_combo)
+        self.role_order_table.setCellWidget(row, 1, field)
+
+    def _group_combo(self, value: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        for name in self.available_groups:
+            combo.addItem(name)
+        if value and combo.findText(value) < 0:
+            combo.addItem(value)
+        if value:
+            combo.setCurrentText(value)
+        return combo
+
+
 class PolicyComposerDialog(QDialog):
     def __init__(self, *, name: str = "", params: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
@@ -2624,6 +3194,8 @@ class PolicyComposerDialog(QDialog):
         timeblocks = _timeblocks_from_params(params)
         block_names = [row["name"] for row in timeblocks]
         default_role_groups = build_default_policy().get("role_groups", {})
+        default_shift_presets = build_default_policy().get("shift_presets", {})
+        default_seasonal = build_default_policy().get("seasonal_settings", {})
         default_anchors = build_default_policy().get("anchors", {})
         roles_payload: Dict[str, Any] = {}
         existing_roles = params.get("roles") if isinstance(params, dict) else {}
@@ -2690,6 +3262,21 @@ class PolicyComposerDialog(QDialog):
                 if isinstance(params.get("role_groups"), dict)
                 else default_role_groups
             ),
+            "shift_presets": (
+                params.get("shift_presets")
+                if isinstance(params.get("shift_presets"), dict)
+                else default_shift_presets
+            ),
+            "section_capacity": (
+                params.get("section_capacity")
+                if isinstance(params.get("section_capacity"), dict)
+                else default_section_capacity
+            ),
+            "seasonal_settings": (
+                params.get("seasonal_settings")
+                if isinstance(params.get("seasonal_settings"), dict)
+                else default_seasonal
+            ),
             "anchors": params.get("anchors") if isinstance(params.get("anchors"), dict) else default_anchors,
         }
 
@@ -2740,6 +3327,18 @@ class PolicyComposerDialog(QDialog):
             "Controls opener/closer ordering and staggered cuts: Off = ignore; "
             "Prefer = keep first-in/first-out when possible; Enforce = strongly prioritize that order."
         )
+        self.cut_priority_editor = CutPriorityEditor()
+        self.cut_priority_editor.set_config(anchors_cfg.get("cut_priority"))
+        self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
+        self.shift_template_editor.set_config(self.policy_payload.get("shift_presets", {}))
+        self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
+        self.section_capacity_editor.set_config(self.policy_payload.get("section_capacity", {}))
+        seasonal_settings = self.policy_payload.get("seasonal_settings", {})
+        seasonal_box = QGroupBox("Seasonal options")
+        seasonal_layout = QVBoxLayout(seasonal_box)
+        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
+        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
+        seasonal_layout.addWidget(self.patio_toggle)
 
         intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
         intro.setWordWrap(True)
@@ -2860,6 +3459,10 @@ class PolicyComposerDialog(QDialog):
                 "cut_buffer": cut_spin,
             }
         layout.addWidget(labor_box)
+        layout.addWidget(self.cut_priority_editor)
+        layout.addWidget(self.shift_template_editor)
+        layout.addWidget(self.section_capacity_editor)
+        layout.addWidget(seasonal_box)
 
         layout.addStretch(1)
         return widget
@@ -3285,7 +3888,15 @@ class PolicyComposerDialog(QDialog):
             self.policy_payload["role_groups"] = role_groups_payload
         anchors_payload = self.policy_data.get("anchors", build_default_policy().get("anchors", {})).copy()
         anchors_payload["open_close_order"] = self.open_close_combo.currentData()
+        anchors_payload["cut_priority"] = self.cut_priority_editor.value()
         self.policy_payload["anchors"] = anchors_payload
+        self.policy_payload["shift_presets"] = self.shift_template_editor.value()
+        seasonal_payload = {"server_patio_enabled": self.patio_toggle.isChecked()}
+        self.policy_payload["seasonal_settings"] = seasonal_payload
+        patio_role = self.role_models.get("Server - Patio")
+        if patio_role is not None:
+            patio_role["enabled"] = bool(seasonal_payload["server_patio_enabled"])
+        self.policy_payload["section_capacity"] = self.section_capacity_editor.value()
         params = {
             "description": self.policy_payload.get("description", ""),
             "global": self.policy_payload["global"],
@@ -3295,6 +3906,8 @@ class PolicyComposerDialog(QDialog):
             "business_hours": self.policy_payload["business_hours"],
             "roles": self.role_models,
             "role_groups": self.policy_payload.get("role_groups", {}),
+            "shift_presets": self.policy_payload.get("shift_presets", {}),
+            "section_capacity": self.policy_payload.get("section_capacity", {}),
             "anchors": self.policy_payload.get("anchors", {}),
         }
         self.result_data = {"name": name, "params": params}
@@ -3425,6 +4038,19 @@ class PolicyDialog(QDialog):
         self.role_group_table.verticalHeader().setVisible(False)
         groups_layout.addWidget(self.role_group_table)
         layout.addWidget(groups_box)
+        self.cut_priority_editor = CutPriorityEditor()
+        layout.addWidget(self.cut_priority_editor)
+        self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
+        layout.addWidget(self.shift_template_editor)
+        self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
+        layout.addWidget(self.section_capacity_editor)
+        seasonal_settings = self.policy_data.get("seasonal_settings", {})
+        seasonal_box = QGroupBox("Seasonal options")
+        seasonal_layout = QVBoxLayout(seasonal_box)
+        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
+        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
+        seasonal_layout.addWidget(self.patio_toggle)
+        layout.addWidget(seasonal_box)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
@@ -3485,6 +4111,9 @@ class PolicyDialog(QDialog):
             self.save_button.setEnabled(False)
             self.export_button.setEnabled(False)
             self.import_button.setEnabled(False)
+            self.cut_priority_editor.set_read_only(True)
+            self.shift_template_editor.setEnabled(False)
+            self.section_capacity_editor.setEnabled(False)
 
     def _load_policy(self) -> None:
         with self.session_factory() as session:
@@ -3516,6 +4145,9 @@ class PolicyDialog(QDialog):
         idx = self.open_close_combo.findData(order_value if order_value in {"off", "prefer", "enforce"} else "prefer")
         if idx >= 0:
             self.open_close_combo.setCurrentIndex(idx)
+        self.cut_priority_editor.set_config(anchors_cfg.get("cut_priority"))
+        self.shift_template_editor.set_config(self.policy_data.get("shift_presets", {}))
+        self.section_capacity_editor.set_config(self.policy_data.get("section_capacity", {}))
         labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
         if labor_pct <= 1:
             labor_pct *= 100
@@ -3625,8 +4257,18 @@ class PolicyDialog(QDialog):
             "business_hours": self._read_hours_table(),
             "roles": self.policy_data.get("roles") or {},
             "role_groups": self._read_role_groups(),
+            "shift_presets": self.shift_template_editor.value(),
+            "section_capacity": self.section_capacity_editor.value(),
+            "seasonal_settings": self.policy_data.get("seasonal_settings", {}),
+            "anchors": self._collect_anchors_payload(),
         }
         return params
+
+    def _collect_anchors_payload(self) -> Dict[str, Any]:
+        anchors = copy.deepcopy(self.policy_data.get("anchors") or {})
+        anchors["open_close_order"] = self.open_close_combo.currentData()
+        anchors["cut_priority"] = self.cut_priority_editor.value()
+        return anchors
 
     def _save_policy(self) -> None:
         if self.read_only:
@@ -3720,7 +4362,11 @@ class PolicyDialog(QDialog):
         defaults = build_default_policy()
         self.policy_data.setdefault("roles", defaults.get("roles", {}))
         self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
-        self.policy_data.setdefault("anchors", defaults.get("anchors", {}))
+        anchors_defaults = defaults.get("anchors", {})
+        anchors_payload = self.policy_data.setdefault("anchors", anchors_defaults.copy())
+        anchors_payload.setdefault("cut_priority", anchors_defaults.get("cut_priority", {}))
+        self.policy_data.setdefault("shift_presets", defaults.get("shift_presets", {}))
+        self.policy_data.setdefault("section_capacity", defaults.get("section_capacity", {}))
         hours = self.policy_data.setdefault("business_hours", defaults.get("business_hours", _default_business_hours()))
         defaults_hours = defaults.get("business_hours", _default_business_hours())
         for day in WEEKDAY_LABELS:
@@ -3773,6 +4419,7 @@ class EmployeeEditDialog(QDialog):
         self.result_employee_id: Optional[int] = None
         self.result_action: Optional[str] = None
         self.result_snapshot: Dict[str, Any] = {}
+        self.role_wage_overrides: Dict[str, float] = {}
         if self.employee_id is not None:
             with self.session_factory() as session:
                 self.employee = session.get(Employee, self.employee_id)
@@ -3835,6 +4482,10 @@ class EmployeeEditDialog(QDialog):
 
         form.addRow("Roles", roles_container)
 
+        self.role_wage_button = QPushButton("Role wage overrides")
+        self.role_wage_button.clicked.connect(self._edit_role_wages)
+        form.addRow("", self.role_wage_button)
+
         self.start_month_combo = QComboBox()
         self.start_month_combo.addItem("Not set", None)
         for month_index in range(1, 13):
@@ -3888,6 +4539,9 @@ class EmployeeEditDialog(QDialog):
         self.desired_hours_input.setValue(self.employee.desired_hours or 0)
         self.status_combo.setCurrentIndex(0 if self.employee.status == "active" else 1)
         self.notes_input.setPlainText(self.employee.notes or "")
+        with self.session_factory() as session:
+            wages = get_employee_role_wages(session, [self.employee.id])
+            self.role_wage_overrides = wages.get(self.employee.id, {})
 
     def _collect_roles(self) -> List[str]:
         roles: List[str] = []
@@ -3958,6 +4612,14 @@ class EmployeeEditDialog(QDialog):
         has_selection = self.role_list_widget.currentItem() is not None
         self.remove_role_button.setEnabled(has_selection)
 
+    def _edit_role_wages(self) -> None:
+        roles = self._collect_roles()
+        dialog = EmployeeRoleWageDialog(roles, self.role_wage_overrides)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() == QDialog.Accepted:
+            self.role_wage_overrides = dialog.overrides
+            self.feedback_label.setText("Saved role wage overrides in memory; click OK to persist.")
+
     def accept(self) -> None:  # type: ignore[override]
         full_name = self.name_input.text().strip()
         if not full_name:
@@ -3999,6 +4661,8 @@ class EmployeeEditDialog(QDialog):
 
             session.commit()
             session.refresh(employee)
+            if self.role_wage_overrides is not None:
+                save_employee_role_wages(session, employee.id, self.role_wage_overrides)
 
         self.result_employee_id = employee.id
         self.result_action = action
@@ -4107,11 +4771,13 @@ class WageManagerDialog(QDialog):
             return
         wage = self.wage_inputs.get(role).value() if role in self.wage_inputs else 0.0
         confirmed = self.confirm_boxes.get(role).isChecked() if role in self.confirm_boxes else False
-        if wage > 0 and confirmed:
-            status_item.setText("✓")
+        normalized = normalize_role(role)
+        zero_allowed = normalized in ALLOW_ZERO_ROLES
+        if (wage > 0 or zero_allowed) and confirmed:
+            status_item.setText("OK")
             status_item.setForeground(Qt.green)
-        elif wage > 0:
-            status_item.setText("⚠")
+        elif wage > 0 or zero_allowed:
+            status_item.setText("Set")
             status_item.setForeground(Qt.yellow)
         else:
             status_item.setText("!")
@@ -4174,12 +4840,14 @@ class WageManagerDialog(QDialog):
         payload: Dict[str, Dict[str, Any]] = {}
         for role in self.roles:
             wage = round(self.wage_inputs[role].value(), 2)
-            if wage <= 0.0:
+            normalized = normalize_role(role)
+            zero_allowed = normalized in ALLOW_ZERO_ROLES
+            if wage <= 0.0 and not zero_allowed:
                 QMessageBox.warning(self, "Missing wage", f"Enter a wage for {role} before saving.")
                 return
             payload[role] = {
                 "wage": wage,
-                "confirmed": self.confirm_boxes[role].isChecked(),
+                "confirmed": self.confirm_boxes[role].isChecked() or zero_allowed,
             }
         save_wages(payload)
         super().accept()
@@ -4438,7 +5106,7 @@ class EmployeeDirectoryDialog(QDialog):
         self.employees: List[Employee] = []
         self.visible_employees: List[Employee] = []
         self.setWindowTitle("Employee directory")
-        self.resize(1100, 460)
+        self.resize(2000, 1560)
         self.setMinimumWidth(1100)
         self._build_ui()
         self.refresh_table()
@@ -4494,6 +5162,10 @@ class EmployeeDirectoryDialog(QDialog):
         self.availability_button.clicked.connect(self.manage_availability)
         buttons.addWidget(self.availability_button)
 
+        self.wage_override_button = QPushButton("Manage role wages")
+        self.wage_override_button.clicked.connect(self.manage_role_wages)
+        buttons.addWidget(self.wage_override_button)
+
         buttons.addStretch()
         layout.addLayout(buttons)
 
@@ -4543,6 +5215,7 @@ class EmployeeDirectoryDialog(QDialog):
         self.edit_button.setEnabled(has_selection)
         self.toggle_button.setEnabled(has_selection)
         self.availability_button.setEnabled(has_selection)
+        self.wage_override_button.setEnabled(has_selection)
         if employee:
             self.toggle_button.setText("Deactivate" if employee.status == "active" else "Activate")
         else:
@@ -4656,6 +5329,87 @@ class EmployeeDirectoryDialog(QDialog):
         dialog = UnavailabilityDialog(self.session_factory, self.actor, employee.id)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
+
+    def manage_role_wages(self) -> None:
+        employee = self.selected_employee()
+        if not employee:
+            return
+        with self.session_factory() as session:
+            overrides = get_employee_role_wages(session, [employee.id]).get(employee.id, {})
+        available_roles = employee.role_list or []
+        dialog = EmployeeRoleWageDialog(available_roles, overrides)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() == QDialog.Accepted:
+            with self.session_factory() as session:
+                save_employee_role_wages(session, employee.id, dialog.overrides)
+
+
+class EmployeeRoleWageDialog(QDialog):
+    def __init__(self, roles: List[str], overrides: Dict[str, float]) -> None:
+        super().__init__()
+        self.setWindowTitle("Role wage overrides")
+        self.available_roles = sorted(set(role for role in roles if role))
+        self.overrides: Dict[str, float] = {role: float(value) for role, value in (overrides or {}).items()}
+        self._build_ui()
+        self._refresh_list()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        form = QHBoxLayout()
+        self.role_combo = QComboBox()
+        self.role_combo.setEditable(True)
+        self.role_combo.setInsertPolicy(QComboBox.NoInsert)
+        for role in self.available_roles:
+            self.role_combo.addItem(role)
+        self.role_combo.setCurrentIndex(-1)
+        form.addWidget(self.role_combo)
+
+        self.wage_input = QDoubleSpinBox()
+        self.wage_input.setPrefix("$")
+        self.wage_input.setDecimals(2)
+        self.wage_input.setRange(0.0, 1000.0)
+        self.wage_input.setValue(15.0)
+        form.addWidget(self.wage_input)
+
+        add_button = QPushButton("Add / update")
+        add_button.clicked.connect(self._add_override)
+        form.addWidget(add_button)
+        layout.addLayout(form)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.list_widget)
+
+        remove_button = QPushButton("Remove selected")
+        remove_button.clicked.connect(self._remove_selected)
+        layout.addWidget(remove_button)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_list(self) -> None:
+        self.list_widget.clear()
+        for role, wage in sorted(self.overrides.items()):
+            self.list_widget.addItem(f"{role} — ${wage:.2f}")
+
+    def _add_override(self) -> None:
+        role = (self.role_combo.currentText() or "").strip()
+        if not role:
+            return
+        wage = round(float(self.wage_input.value()), 2)
+        self.overrides[role] = wage
+        self._refresh_list()
+
+    def _remove_selected(self) -> None:
+        current = self.list_widget.currentItem()
+        if not current:
+            return
+        role = current.text().split(" — ", 1)[0].strip()
+        if role in self.overrides:
+            del self.overrides[role]
+        self._refresh_list()
 
 
 class ChangePasswordDialog(QDialog):
@@ -4847,6 +5601,7 @@ class MainWindow(QMainWindow):
         )
         self.validation_page = ValidationImportExportPage(
             self.session_factory,
+            EmployeeSessionLocal,
             self.user,
             self.active_week,
             on_week_changed=self._handle_validation_week_change,
@@ -4933,6 +5688,9 @@ class MainWindow(QMainWindow):
         self.installEventFilter(self)
         if self.centralWidget():
             self.centralWidget().installEventFilter(self)
+        app = QApplication.instance()
+        if app:
+            app.installEventFilter(self)
 
     def reset_session_timers(self) -> None:
         if hasattr(self, "warning_timer") and hasattr(self, "logout_timer"):
@@ -5013,7 +5771,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def open_employee_directory(self) -> None:
-        dialog = EmployeeDirectoryDialog(self.session_factory, self.user)
+        dialog = EmployeeDirectoryDialog(EmployeeSessionLocal, self.user)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
 

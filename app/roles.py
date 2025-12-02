@@ -5,35 +5,46 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 ROLE_GROUPS: Dict[str, List[str]] = {
     "Kitchen": [
-        "Kitchen Opener",
-        "Kitchen Closer",
-        "Expo",
-        "Grill",
-        "Chip",
-        "Shake",
-        "Prep",
-        "Cook",
+        "HOH - Opener",
+        "HOH - Closer",
+        "HOH - Training",
+        "HOH - Expo",
+        "HOH - Grill",
+        "HOH - Southwest",
+        "HOH - Chip",
+        "HOH - Shake",
+        "HOH - Prep",
+        "HOH - Cook",
+        "HOH - All Roles",  # simply means all other roles can be fulfilled/considered for this employee
     ],
     "Servers": [
         "Server - Dining",
-        "Server - Dining Opener",
+        "Server - Opener",
         "Server - Dining Preclose",
         "Server - Dining Closer",
+        "Server - Training",
         "Server - Patio",
         "Server - Cocktail",
-        "Server - Cocktail Opener",
         "Server - Cocktail Preclose",
         "Server - Cocktail Closer",
+        "Server - All Roles", # not a real role, but rather easy to select that employee can fulfill all
     ],
     "Bartenders": [
         "Bartender",
         "Bartender - Opener",
         "Bartender - Closer",
+        "Bartender - Training",
     ],
     "Cashier": [
         "Cashier",
-        "Cashier - To-Go Specialist",
-        "Host",
+        "Cashier - To-Go",
+        "Cashier - Host",
+        "Cashier - Training",
+        "Cashier - All Roles", # all role flag, not a real working role
+    ],
+    "Management": [
+        "Shift Lead",
+        "MGR - FOH",
     ],
 }
 
@@ -42,6 +53,7 @@ ROLE_COLORS: Dict[str, str] = {
     "Servers": "#1c4641",
     "Bartenders": "#4a1f43",
     "Cashier": "#4a3a1f",
+    "Management": "#313c57",
     "Other": "#2f2f2f",
 }
 
@@ -59,6 +71,9 @@ _KEYWORD_RULES: List[Tuple[str, str]] = [
     ("grill", "Kitchen"),
     ("chip", "Kitchen"),
     ("shake", "Kitchen"),
+    ("hoh", "Kitchen"),
+    ("lead", "Management"),
+    ("mgr", "Management"),
 ]
 
 
@@ -70,7 +85,7 @@ def is_manager_role(role: str) -> bool:
     label = normalize_role(role)
     if not label:
         return False
-    return "manager" in label or "mgr" in label
+    return "mgr" in label or "MGR" in label
 
 
 def role_group(role: str) -> str:

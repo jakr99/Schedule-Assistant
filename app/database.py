@@ -8,6 +8,7 @@ import json
 from sqlalchemy import (
     Date,
     DateTime,
+    delete,
     Float,
     ForeignKey,
     Integer,
@@ -26,7 +27,10 @@ from roles import is_manager_role
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DATABASE_URL = f"sqlite:///{(DATA_DIR / 'schedule.db').as_posix()}"
+EMPLOYEE_DATABASE_URL = f"sqlite:///{(DATA_DIR / 'employees.db').as_posix()}"
+SCHEDULE_DATABASE_URL = f"sqlite:///{(DATA_DIR / 'schedule.db').as_posix()}"
+POLICY_DATABASE_URL = f"sqlite:///{(DATA_DIR / 'policy.db').as_posix()}"
+PROJECTIONS_DATABASE_URL = f"sqlite:///{(DATA_DIR / 'projections.db').as_posix()}"
 WEEK_STATUS_CHOICES = {"draft", "validated", "exported"}
 
 
@@ -51,11 +55,31 @@ def _format_week_label(week_start: datetime.date) -> str:
     return f"{iso_year} W{iso_week:02d} ({start_str} - {end_str})"
 
 
-class Base(DeclarativeBase):
+class EmployeeBase(DeclarativeBase):
+    """Standalone metadata for employee tables living in employees.db."""
+
     pass
 
 
-class Employee(Base):
+class PolicyBase(DeclarativeBase):
+    """Standalone metadata for policy tables living in policy.db."""
+
+    pass
+
+
+class ProjectionsBase(DeclarativeBase):
+    """Standalone metadata for projections tables living in projections.db."""
+
+    pass
+
+
+class Base(DeclarativeBase):
+    """Metadata for schedule/policy tables living in schedule.db."""
+
+    pass
+
+
+class Employee(EmployeeBase):
     __tablename__ = "employees"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -78,6 +102,9 @@ class Employee(Base):
     unavailability: Mapped[List["EmployeeUnavailability"]] = relationship(
         back_populates="employee", cascade="all, delete-orphan"
     )
+    role_wages: Mapped[List["EmployeeRoleWage"]] = relationship(
+        back_populates="employee", cascade="all, delete-orphan"
+    )
 
     @property
     def role_list(self) -> List[str]:
@@ -97,7 +124,7 @@ class Employee(Base):
         return "Not set"
 
 
-class EmployeeUnavailability(Base):
+class EmployeeUnavailability(EmployeeBase):
     __tablename__ = "employee_unavailability"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -107,6 +134,30 @@ class EmployeeUnavailability(Base):
     end_time: Mapped[datetime.time] = mapped_column(Time, nullable=False)
 
     employee: Mapped[Employee] = relationship(back_populates="unavailability")
+
+
+class EmployeeRoleWage(EmployeeBase):
+    __tablename__ = "employee_role_wages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(80), nullable=False)
+    wage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    confirmed: Mapped[bool] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.datetime.now(datetime.timezone.utc)
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.datetime.now(datetime.timezone.utc),
+        onupdate=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    employee: Mapped[Employee] = relationship(back_populates="role_wages")
+
+    __table_args__ = (
+        UniqueConstraint("employee_id", "role", name="uq_employee_role_wage_role"),
+    )
 
 
 class WeekContext(Base):
@@ -122,19 +173,38 @@ class WeekContext(Base):
 
     __table_args__ = (UniqueConstraint("iso_year", "iso_week", name="uq_week_context_year_week"),)
 
-    projections: Mapped[List["WeekDailyProjection"]] = relationship(
-        back_populates="week", cascade="all, delete-orphan"
-    )
     modifiers: Mapped[List["Modifier"]] = relationship(
         back_populates="week", cascade="all, delete-orphan"
     )
 
 
-class WeekDailyProjection(Base):
+class WeekProjectionContext(ProjectionsBase):
+    __tablename__ = "week_projection_context"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    schedule_context_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    iso_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    iso_week: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("iso_year", "iso_week", name="uq_projection_context_year_week"),
+        UniqueConstraint("schedule_context_id", name="uq_projection_schedule_context"),
+    )
+
+
+class WeekDailyProjection(ProjectionsBase):
     __tablename__ = "week_daily_projections"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    week_id: Mapped[int] = mapped_column(ForeignKey("week_context.id", ondelete="CASCADE"), nullable=False)
+    projection_context_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    schedule_context_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    iso_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    iso_week: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(String(40), nullable=False)
     day_of_week: Mapped[int] = mapped_column(Integer, nullable=False)
     projected_sales_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     projected_notes: Mapped[str] = mapped_column(String(200), nullable=False, default="")
@@ -144,9 +214,7 @@ class WeekDailyProjection(Base):
         onupdate=datetime.datetime.now(datetime.timezone.utc),
     )
 
-    week: Mapped[WeekContext] = relationship(back_populates="projections")
-
-    __table_args__ = (UniqueConstraint("week_id", "day_of_week", name="uq_daily_projection_week_day"),)
+    __table_args__ = (UniqueConstraint("projection_context_id", "day_of_week", name="uq_daily_projection_week_day"),)
 
 
 class Modifier(Base):
@@ -196,7 +264,7 @@ class SavedModifier(Base):
     )
 
 
-class Policy(Base):
+class Policy(PolicyBase):
     __tablename__ = "policies"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -252,7 +320,7 @@ class Shift(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     week_id: Mapped[int] = mapped_column(ForeignKey("week_schedule.id", ondelete="CASCADE"), nullable=False)
-    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    employee_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     start: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -271,9 +339,6 @@ class Shift(Base):
     )
 
     week: Mapped[WeekSchedule] = relationship(back_populates="shifts")
-    employee: Mapped[Employee] = relationship()
-
-
 class AuditLog(Base):
     __tablename__ = "audit_log"
 
@@ -288,17 +353,38 @@ class AuditLog(Base):
     )
 
 
-engine = create_engine(
-    DATABASE_URL,
+employee_engine = create_engine(
+    EMPLOYEE_DATABASE_URL,
     echo=False,
     future=True,
 )
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+schedule_engine = create_engine(
+    SCHEDULE_DATABASE_URL,
+    echo=False,
+    future=True,
+)
+policy_engine = create_engine(
+    POLICY_DATABASE_URL,
+    echo=False,
+    future=True,
+)
+projections_engine = create_engine(
+    PROJECTIONS_DATABASE_URL,
+    echo=False,
+    future=True,
+)
+SessionLocal = sessionmaker(bind=schedule_engine, expire_on_commit=False, future=True)
+EmployeeSessionLocal = sessionmaker(bind=employee_engine, expire_on_commit=False, future=True)
+PolicySessionLocal = sessionmaker(bind=policy_engine, expire_on_commit=False, future=True)
+ProjectionSessionLocal = sessionmaker(bind=projections_engine, expire_on_commit=False, future=True)
 
 
 def init_database() -> None:
-    Base.metadata.create_all(engine)
-    with engine.begin() as conn:
+    EmployeeBase.metadata.create_all(employee_engine)
+    Base.metadata.create_all(schedule_engine)
+    PolicyBase.metadata.create_all(policy_engine)
+    ProjectionsBase.metadata.create_all(projections_engine)
+    with employee_engine.begin() as conn:
         columns = {
             row[1]: True
             for row in conn.execute(text("PRAGMA table_info(employees)"))
@@ -307,6 +393,12 @@ def init_database() -> None:
             conn.execute(text("ALTER TABLE employees ADD COLUMN start_month INTEGER"))
         if "start_year" not in columns:
             conn.execute(text("ALTER TABLE employees ADD COLUMN start_year INTEGER"))
+        wage_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='employee_role_wages'")
+        ).scalar()
+        if not wage_exists:
+            EmployeeBase.metadata.tables["employee_role_wages"].create(conn)
+    with schedule_engine.begin() as conn:
         table_exists = conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='table' AND name='week_daily_projections'")
         ).scalar()
@@ -335,11 +427,193 @@ def init_database() -> None:
                         "ALTER TABLE policies ADD COLUMN lastEditedAt DATETIME DEFAULT (datetime('now'))"
                     )
                 )
+    with policy_engine.begin() as conn:
+        cols = {row[1]: True for row in conn.execute(text("PRAGMA table_info(policies)"))}
+        if "lastEditedBy" not in cols:
+            conn.execute(text("ALTER TABLE policies ADD COLUMN lastEditedBy VARCHAR(60) NOT NULL DEFAULT 'system'"))
+        if "lastEditedAt" not in cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE policies ADD COLUMN lastEditedAt DATETIME DEFAULT (datetime('now'))"
+                )
+            )
+    _migrate_legacy_projections()
 
 
-def get_all_employees(session) -> List[Employee]:
-    stmt = select(Employee).order_by(Employee.full_name)
-    return list(session.scalars(stmt))
+def _migrate_legacy_projections() -> None:
+    """Populate the dedicated projections database from any legacy schedule data."""
+    try:
+        with projections_engine.connect() as conn:
+            existing_rows = conn.execute(text("SELECT COUNT(*) FROM week_daily_projections")).scalar()
+            if existing_rows and int(existing_rows) > 0:
+                return
+    except Exception:
+        # If the projections DB is not reachable, silently skip migration.
+        return
+
+    with schedule_engine.connect() as legacy_conn:
+        legacy_table = legacy_conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='week_daily_projections'")
+        ).scalar()
+        if not legacy_table:
+            return
+        columns = {row[1]: True for row in legacy_conn.execute(text("PRAGMA table_info(week_daily_projections)"))}
+        if "projected_sales_amount" in columns:
+            amount_column = "projected_sales_amount"
+        elif "projected_labor_hours" in columns:
+            amount_column = "projected_labor_hours"
+        else:
+            return
+        legacy_rows = legacy_conn.execute(
+            text(
+                f"SELECT week_id, day_of_week, {amount_column} AS amount, "
+                "COALESCE(projected_notes, '') AS notes FROM week_daily_projections"
+            )
+        ).fetchall()
+        contexts = {
+            row[0]: {"iso_year": row[1], "iso_week": row[2], "label": row[3]}
+            for row in legacy_conn.execute(text("SELECT id, iso_year, iso_week, label FROM week_context"))
+        }
+    if not legacy_rows:
+        return
+
+    with ProjectionSessionLocal() as projection_session:
+        for week_id, day_of_week, amount, notes in legacy_rows:
+            ctx_info = contexts.get(week_id)
+            if not ctx_info:
+                continue
+            projection_context = get_or_create_projection_context(
+                projection_session,
+                iso_year=int(ctx_info["iso_year"]),
+                iso_week=int(ctx_info["iso_week"]),
+                label=ctx_info.get("label") or f"{ctx_info['iso_year']} W{ctx_info['iso_week']:02d}",
+                schedule_context_id=week_id,
+            )
+            existing = projection_session.scalars(
+                select(WeekDailyProjection).where(
+                    WeekDailyProjection.projection_context_id == projection_context.id,
+                    WeekDailyProjection.day_of_week == int(day_of_week),
+                )
+            ).first()
+            if existing:
+                existing.projected_sales_amount = float(amount or 0.0)
+                existing.projected_notes = notes or ""
+                continue
+            projection_session.add(
+                WeekDailyProjection(
+                    projection_context_id=projection_context.id,
+                    schedule_context_id=week_id,
+                    iso_year=projection_context.iso_year,
+                    iso_week=projection_context.iso_week,
+                    label=projection_context.label,
+                    day_of_week=int(day_of_week),
+                    projected_sales_amount=float(amount or 0.0),
+                    projected_notes=notes or "",
+                )
+            )
+        projection_session.commit()
+
+
+def _coerce_employee_session(session):
+    """Return (employee_session, should_close) ensuring we talk to the employee database."""
+    if session is None:
+        return EmployeeSessionLocal(), True
+    bind = getattr(session, "bind", None)
+    if bind is schedule_engine:
+        return EmployeeSessionLocal(), True
+    return session, False
+
+
+def _coerce_policy_session(session):
+    """Return (policy_session, should_close) ensuring policy data stays in its own database."""
+    PolicyBase.metadata.create_all(policy_engine)
+    if session is None:
+        return PolicySessionLocal(), True
+    bind = getattr(session, "bind", None)
+    if bind is schedule_engine or bind is employee_engine:
+        return PolicySessionLocal(), True
+    return session, False
+
+
+def _coerce_projection_session(session):
+    """Return (projection_session, should_close) scoped to the projections database."""
+    ProjectionsBase.metadata.create_all(projections_engine)
+    if session is None:
+        return ProjectionSessionLocal(), True
+    bind = getattr(session, "bind", None)
+    if bind in {schedule_engine, employee_engine, policy_engine}:
+        return ProjectionSessionLocal(), True
+    return session, False
+
+
+def _resolve_week_context(schedule_session, week_identifier) -> WeekContext | None:
+    if isinstance(week_identifier, WeekContext):
+        return week_identifier
+    if schedule_session is None:
+        return None
+    try:
+        return schedule_session.get(WeekContext, week_identifier)
+    except Exception:
+        stmt = select(WeekContext).where(WeekContext.id == week_identifier)
+        return schedule_session.scalars(stmt).first()
+
+
+def get_or_create_projection_context(
+    projection_session,
+    *,
+    iso_year: int,
+    iso_week: int,
+    label: str,
+    schedule_context_id: int | None = None,
+) -> WeekProjectionContext:
+    projection_session, close_session = _coerce_projection_session(projection_session)
+    try:
+        if schedule_context_id is not None:
+            existing = projection_session.scalars(
+                select(WeekProjectionContext).where(WeekProjectionContext.schedule_context_id == schedule_context_id)
+            ).first()
+            if existing:
+                if label and existing.label != label:
+                    existing.label = label
+                    projection_session.commit()
+                    projection_session.refresh(existing)
+                return existing
+        stmt = select(WeekProjectionContext).where(
+            WeekProjectionContext.iso_year == iso_year,
+            WeekProjectionContext.iso_week == iso_week,
+        )
+        context = projection_session.scalars(stmt).first()
+        if context:
+            if schedule_context_id is not None and context.schedule_context_id is None:
+                context.schedule_context_id = schedule_context_id
+            if label and context.label != label:
+                context.label = label
+            projection_session.commit()
+            projection_session.refresh(context)
+            return context
+        context = WeekProjectionContext(
+            schedule_context_id=schedule_context_id,
+            iso_year=iso_year,
+            iso_week=iso_week,
+            label=label or f"{iso_year} W{iso_week:02d}",
+        )
+        projection_session.add(context)
+        projection_session.commit()
+        projection_session.refresh(context)
+        return context
+    finally:
+        if close_session:
+            projection_session.close()
+
+
+def get_all_employees(employee_session=None) -> List[Employee]:
+    employee_session, close_session = _coerce_employee_session(employee_session)
+    try:
+        stmt = select(Employee).order_by(Employee.full_name)
+        return list(employee_session.scalars(stmt))
+    finally:
+        if close_session:
+            employee_session.close()
 
 
 def get_all_weeks(session) -> List[WeekContext]:
@@ -362,39 +636,88 @@ def get_or_create_week_context(session, iso_year: int, iso_week: int, label: str
     return week
 
 
-def get_week_daily_projections(session, week_id: int) -> List[WeekDailyProjection]:
-    stmt = select(WeekDailyProjection).where(WeekDailyProjection.week_id == week_id)
-    projections = {item.day_of_week: item for item in session.scalars(stmt)}
+def get_week_daily_projections(schedule_session, week_id: int | WeekContext, *, projection_session=None) -> List[WeekDailyProjection]:
+    close_schedule = False
+    if schedule_session is None:
+        schedule_session = SessionLocal()
+        close_schedule = True
+    week_context = _resolve_week_context(schedule_session, week_id)
+    if not week_context:
+        if close_schedule:
+            schedule_session.close()
+        return []
+    projection_session, close_projection = _coerce_projection_session(projection_session)
+    projection_context = get_or_create_projection_context(
+        projection_session,
+        iso_year=week_context.iso_year,
+        iso_week=week_context.iso_week,
+        label=week_context.label,
+        schedule_context_id=week_context.id,
+    )
+    stmt = select(WeekDailyProjection).where(WeekDailyProjection.projection_context_id == projection_context.id)
+    projections = {item.day_of_week: item for item in projection_session.scalars(stmt)}
     created = False
     for day in range(7):
         if day not in projections:
-            projection = WeekDailyProjection(week_id=week_id, day_of_week=day, projected_sales_amount=0.0)
-            session.add(projection)
+            projection = WeekDailyProjection(
+                projection_context_id=projection_context.id,
+                schedule_context_id=week_context.id,
+                iso_year=projection_context.iso_year,
+                iso_week=projection_context.iso_week,
+                label=projection_context.label,
+                day_of_week=day,
+                projected_sales_amount=0.0,
+            )
+            projection_session.add(projection)
             projections[day] = projection
             created = True
     if created:
-        session.commit()
+        projection_session.commit()
         for projection in projections.values():
-            session.refresh(projection)
-    return [projections[day] for day in sorted(projections)]
+            projection_session.refresh(projection)
+    result = [projections[day] for day in sorted(projections)]
+    if close_projection:
+        projection_session.close()
+    if close_schedule:
+        schedule_session.close()
+    return result
 
 
 def save_week_daily_projection_values(
-    session,
-    week_id: int,
+    schedule_session,
+    week_id: int | WeekContext,
     values: Dict[int, Dict[str, float | str]],
+    *,
+    projection_session=None,
 ) -> None:
-    projections = get_week_daily_projections(session, week_id)
+    close_schedule = False
+    if schedule_session is None:
+        schedule_session = SessionLocal()
+        close_schedule = True
+    projection_session, close_projection = _coerce_projection_session(projection_session)
+    projections = get_week_daily_projections(
+        schedule_session,
+        week_id,
+        projection_session=projection_session,
+    )
     mapping = {item.day_of_week: item for item in projections}
-    for day, payload in values.items():
-        projection = mapping.get(day)
+    for day, payload in (values or {}).items():
+        try:
+            day_index = int(day)
+        except Exception:
+            continue
+        projection = mapping.get(day_index)
         if not projection:
             continue
         amount = float(payload.get("projected_sales_amount", projection.projected_sales_amount))
         notes = str(payload.get("projected_notes", projection.projected_notes or ""))
         projection.projected_sales_amount = max(amount, 0.0)
         projection.projected_notes = notes.strip()
-    session.commit()
+    projection_session.commit()
+    if close_projection:
+        projection_session.close()
+    if close_schedule:
+        schedule_session.close()
 
 
 def get_week_modifiers(session, week_id: int) -> List[Modifier]:
@@ -472,42 +795,62 @@ def apply_saved_modifier_to_week(
 
 
 def get_policies(session) -> List[Policy]:
-    stmt = select(Policy).order_by(Policy.name.asc(), Policy.id.asc())
-    return list(session.scalars(stmt))
+    policy_session, close_session = _coerce_policy_session(session)
+    try:
+        stmt = select(Policy).order_by(Policy.name.asc(), Policy.id.asc())
+        return list(policy_session.scalars(stmt))
+    finally:
+        if close_session:
+            policy_session.close()
 
 
 def upsert_policy(session, name: str, params_dict: Dict, *, edited_by: str = "system") -> Policy:
-    existing: Optional[Policy] = session.execute(
-        select(Policy).where(Policy.name == name)
-    ).scalars().first()
-    payload = params_dict if isinstance(params_dict, dict) else {}
-    if existing:
-        existing.paramsJSON = json.dumps(payload)
-        existing.lastEditedBy = edited_by
-        existing.lastEditedAt = datetime.datetime.now(datetime.timezone.utc)
-        session.commit()
-        session.refresh(existing)
-        return existing
-    policy = Policy(
-        name=name,
-        paramsJSON=json.dumps(payload),
-        lastEditedBy=edited_by,
-        lastEditedAt=datetime.datetime.now(datetime.timezone.utc),
-    )
-    session.add(policy)
-    session.commit()
-    session.refresh(policy)
-    return policy
+    policy_session, close_session = _coerce_policy_session(session)
+    try:
+        existing: Optional[Policy] = policy_session.execute(
+            select(Policy).where(Policy.name == name)
+        ).scalars().first()
+        payload = params_dict if isinstance(params_dict, dict) else {}
+        if existing:
+            existing.paramsJSON = json.dumps(payload)
+            existing.lastEditedBy = edited_by
+            existing.lastEditedAt = datetime.datetime.now(datetime.timezone.utc)
+            policy_session.commit()
+            policy_session.refresh(existing)
+            return existing
+        policy = Policy(
+            name=name,
+            paramsJSON=json.dumps(payload),
+            lastEditedBy=edited_by,
+            lastEditedAt=datetime.datetime.now(datetime.timezone.utc),
+        )
+        policy_session.add(policy)
+        policy_session.commit()
+        policy_session.refresh(policy)
+        return policy
+    finally:
+        if close_session:
+            policy_session.close()
 
 
 def delete_policy(session, policy_id: int) -> None:
-    session.query(Policy).filter(Policy.id == policy_id).delete()
-    session.commit()
+    policy_session, close_session = _coerce_policy_session(session)
+    try:
+        policy_session.query(Policy).filter(Policy.id == policy_id).delete()
+        policy_session.commit()
+    finally:
+        if close_session:
+            policy_session.close()
 
 
 def get_active_policy(session) -> Optional[Policy]:
-    stmt = select(Policy).order_by(Policy.lastEditedAt.desc(), Policy.id.desc())
-    return session.scalars(stmt).first()
+    policy_session, close_session = _coerce_policy_session(session)
+    try:
+        stmt = select(Policy).order_by(Policy.lastEditedAt.desc(), Policy.id.desc())
+        return policy_session.scalars(stmt).first()
+    finally:
+        if close_session:
+            policy_session.close()
 
 
 OVERNIGHT_CLOSE_CUTOFF_HOUR = 6
@@ -573,33 +916,41 @@ def get_or_create_week(session, week_start_date: datetime.date) -> WeekSchedule:
     return week
 
 
-def list_employees(session, only_active: bool = True) -> List[Dict[str, Any]]:
-    stmt = select(Employee)
-    if only_active:
-        stmt = stmt.where(Employee.status == "active")
-    stmt = stmt.order_by(Employee.full_name.asc())
-    employees = []
-    for employee in session.scalars(stmt):
-        employees.append(
-            {
-                "id": employee.id,
-                "name": employee.full_name,
-                "roles": employee.role_list,
-                "status": employee.status,
-                "desired_hours": employee.desired_hours,
-            }
-        )
-    return employees
+def list_employees(employee_session=None, only_active: bool = True) -> List[Dict[str, Any]]:
+    employee_session, close_session = _coerce_employee_session(employee_session)
+    try:
+        stmt = select(Employee)
+        if only_active:
+            stmt = stmt.where(Employee.status == "active")
+        stmt = stmt.order_by(Employee.full_name.asc())
+        employees = []
+        for employee in employee_session.scalars(stmt):
+            employees.append(
+                {
+                    "id": employee.id,
+                    "name": employee.full_name,
+                    "roles": employee.role_list,
+                    "status": employee.status,
+                    "desired_hours": employee.desired_hours,
+                }
+            )
+        return employees
+    finally:
+        if close_session:
+            employee_session.close()
 
 
-def list_roles(session) -> List[str]:
+def list_roles(schedule_session, employee_session=None) -> List[str]:
+    employee_session, close_session = _coerce_employee_session(employee_session)
     roles = set()
-    for employee in session.scalars(select(Employee)):
+    for employee in employee_session.scalars(select(Employee)):
         roles.update({role for role in employee.role_list if not is_manager_role(role)})
-    for role in session.execute(select(Shift.role).distinct()):
+    for role in schedule_session.execute(select(Shift.role).distinct()):
         value = role[0]
         if value and not is_manager_role(value):
             roles.add(value)
+    if close_session:
+        employee_session.close()
     return sorted(roles)
 
 
@@ -637,11 +988,11 @@ def get_shifts_for_week(
     employee_id: Optional[int] = None,
     role: Optional[str] = None,
     status: Optional[str] = None,
+    employee_session=None,
 ) -> List[Dict[str, Any]]:
     week = get_or_create_week(session, week_start_date)
     stmt = (
-        select(Shift, Employee)
-        .join(Employee, Shift.employee_id == Employee.id, isouter=True)
+        select(Shift)
         .where(Shift.week_id == week.id)
         .order_by(Shift.start, Shift.end)
     )
@@ -651,13 +1002,61 @@ def get_shifts_for_week(
         stmt = stmt.where(Shift.role == role)
     if status and status.lower() != "all":
         stmt = stmt.where(Shift.status == status.lower())
-    rows = session.execute(stmt).all()
+    shifts = list(session.scalars(stmt))
+    employees: Dict[int, Employee] = {}
+    employee_session, close_session = _coerce_employee_session(employee_session)
+    if employee_session:
+        employees = {emp.id: emp for emp in employee_session.scalars(select(Employee))}
     payload = []
-    for shift, employee in rows:
+    for shift in shifts:
         if is_manager_role(shift.role):
             continue
+        employee = employees.get(shift.employee_id) if employees else None
         payload.append(_shift_to_dict(shift, employee))
+    if close_session:
+        employee_session.close()
     return payload
+
+
+def get_employee_role_wages(employee_session=None, employee_ids: Optional[Iterable[int]] = None) -> Dict[int, Dict[str, float]]:
+    employee_session, close_session = _coerce_employee_session(employee_session)
+    try:
+        stmt = select(EmployeeRoleWage)
+        ids = list(employee_ids or [])
+        if ids:
+            stmt = stmt.where(EmployeeRoleWage.employee_id.in_(ids))
+        wages: Dict[int, Dict[str, float]] = {}
+        for row in employee_session.scalars(stmt):
+            wages.setdefault(row.employee_id, {})[row.role] = float(row.wage or 0.0)
+        return wages
+    finally:
+        if close_session:
+            employee_session.close()
+
+
+def save_employee_role_wages(employee_session, employee_id: int, mapping: Dict[str, float]) -> int:
+    employee_session, close_session = _coerce_employee_session(employee_session)
+    try:
+        employee_session.execute(delete(EmployeeRoleWage).where(EmployeeRoleWage.employee_id == employee_id))
+        count = 0
+        for role, wage in (mapping or {}).items():
+            try:
+                wage_value = round(float(wage), 2)
+            except (TypeError, ValueError):
+                continue
+            entry = EmployeeRoleWage(
+                employee_id=employee_id,
+                role=role,
+                wage=max(0.0, wage_value),
+                confirmed=1,
+            )
+            employee_session.add(entry)
+            count += 1
+        employee_session.commit()
+        return count
+    finally:
+        if close_session:
+            employee_session.close()
 
 
 def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:

@@ -744,11 +744,45 @@ class WeekSchedulePage(QWidget):
             QMessageBox.critical(self, "Generation failed", str(exc))
             return
         self.refresh_shifts()
-        details = "\n".join(result.get("warnings", [])) if result.get("warnings") else "Generator completed."
+        summary_lines: List[str] = []
+        warnings = result.get("warnings") or []
+        if warnings:
+            summary_lines.append("Warnings:")
+            summary_lines.extend([f"- {warning}" for warning in warnings[:5]])
+        validation = result.get("validation") or {}
+        validation_issues = validation.get("issues") or []
+        validation_warnings = validation.get("warnings") or []
+        if validation_issues or validation_warnings:
+            summary_lines.append("Validation findings:")
+            for issue in validation_issues[:5]:
+                message = issue.get("message") if isinstance(issue, dict) else str(issue)
+                summary_lines.append(f"- Issue: {message}")
+            for warn in validation_warnings[:5]:
+                message = warn.get("message") if isinstance(warn, dict) else str(warn)
+                summary_lines.append(f"- Warning: {message}")
+        cut_insights = result.get("cut_insights") or []
+        if cut_insights:
+            summary_lines.append("Recent cut decisions:")
+            for insight in cut_insights[:5]:
+                time_label = insight.get("cut_time", "")[-8:-3]
+                factors = insight.get("factors", {})
+                budget_value = factors.get("budget_gap")
+                if budget_value is None:
+                    budget_value = factors.get("budget_component", 0)
+                if isinstance(budget_value, (int, float)):
+                    budget_display = f"{budget_value:+.3f}"
+                else:
+                    budget_display = str(budget_value)
+                summary_lines.append(
+                    f"- {insight.get('day')} {insight.get('role')} @ {time_label} "
+                    f"(score {insight.get('score')}, budget {budget_display})"
+                )
+        if not summary_lines:
+            summary_lines.append("Generator completed.")
         QMessageBox.information(
             self,
             "Schedule generated",
-            f"Created {result.get('shifts_created', 0)} shifts.\n{details}",
+            f"Created {result.get('shifts_created', 0)} shifts.\n" + "\n".join(summary_lines),
         )
 
     def _pre_generation_checks(self) -> bool:

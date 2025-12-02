@@ -19,6 +19,7 @@ from database import (  # noqa: E402
     Modifier,
     Shift,
     SessionLocal,
+    EmployeeSessionLocal,
     get_or_create_week_context,
     get_or_create_week,
     get_shifts_for_week,
@@ -155,7 +156,12 @@ def run_workflow(week_start: datetime.date, actor: str) -> None:
         _seed_projections(session, week.id)
         _seed_modifiers(session, week.id, created_by=actor)
 
-    result = generate_schedule_for_week(SessionLocal, week_start, actor=actor)
+    result = generate_schedule_for_week(
+        SessionLocal,
+        week_start,
+        actor=actor,
+        employee_session_factory=EmployeeSessionLocal,
+    )
     warnings = result.get("warnings") or []
     print(f"[workflow] Generated {result.get('shifts_created', 0)} shifts for {week_start.isoformat()}.")
     if warnings:
@@ -187,11 +193,11 @@ def run_workflow(week_start: datetime.date, actor: str) -> None:
 
 
 def _autofill_unassigned_shifts(week_start: datetime.date) -> int:
-    with SessionLocal() as session:
+    with SessionLocal() as session, EmployeeSessionLocal() as employee_session:
         week = get_or_create_week(session, week_start)
         shifts = list(session.scalars(select(Shift).where(Shift.week_id == week.id)))
         roster: Dict[str, List[int]] = defaultdict(list)
-        for employee in list_employees(session, only_active=True):
+        for employee in list_employees(employee_session, only_active=True):
             for role in employee.get("roles", []):
                 roster[role].append(employee["id"])
         filled = 0

@@ -16,31 +16,53 @@ if str(APP_DIR) not in sys.path:
 
 from database import (  # noqa: E402
     Base,
+    PolicyBase,
+    EmployeeBase,
+    ProjectionsBase,
     Employee,
     EmployeeUnavailability,
     Shift,
     get_or_create_week,
     get_or_create_week_context,
     get_week_daily_projections,
+    save_week_daily_projection_values,
     shift_display_date,
 )
+import database as db  # noqa: E402
 from generator.api import generate_schedule_for_week as api_generate_schedule_for_week  # noqa: E402
-from generator.engine import ScheduleGenerator  # noqa: E402
+from generator.engine import BlockDemand, ScheduleGenerator  # noqa: E402
+from policy import SHIFT_PRESET_DEFAULTS  # noqa: E402
 
 
 class ScheduleGeneratorTests(unittest.TestCase):
     """Regression tests for the core scheduling heuristics."""
 
     def setUp(self) -> None:
-        self.engine = create_engine("sqlite:///:memory:", future=True)
-        Base.metadata.create_all(self.engine)
-        session_factory = sessionmaker(bind=self.engine, expire_on_commit=False, future=True)
-        self.session = session_factory()
+        self.schedule_engine = create_engine("sqlite:///:memory:", future=True)
+        Base.metadata.create_all(self.schedule_engine)
+        self.employee_engine = create_engine("sqlite:///:memory:", future=True)
+        EmployeeBase.metadata.create_all(self.employee_engine)
+        self.projection_engine = create_engine("sqlite:///:memory:", future=True)
+        ProjectionsBase.metadata.create_all(self.projection_engine)
+        self.session_factory = sessionmaker(bind=self.schedule_engine, expire_on_commit=False, future=True)
+        self.employee_session_factory = sessionmaker(bind=self.employee_engine, expire_on_commit=False, future=True)
+        self.projection_session_factory = sessionmaker(bind=self.projection_engine, expire_on_commit=False, future=True)
+        # For tests, keep policy DB on the same engine as schedule to simplify setup.
+        db.policy_engine = self.schedule_engine
+        db.PolicySessionLocal = self.session_factory
+        db.projections_engine = self.projection_engine
+        db.ProjectionSessionLocal = self.projection_session_factory
+
+        self.session = self.session_factory()
+        self.employee_session = self.employee_session_factory()
         self.week_start = datetime.date(2024, 4, 1)  # Monday
 
     def tearDown(self) -> None:
         self.session.close()
-        self.engine.dispose()
+        self.employee_session.close()
+        self.schedule_engine.dispose()
+        self.employee_engine.dispose()
+        self.projection_engine.dispose()
 
     def test_respects_employee_unavailability(self) -> None:
         policy = self._policy(daily_boost={"Mon": 1})
@@ -347,10 +369,89 @@ class ScheduleGeneratorTests(unittest.TestCase):
         self.assertTrue(any("cut around" in (shift.notes or "").lower() for shift in monday))
         self.assertTrue(any(shift.end.time() < datetime.time(18, 0) for shift in monday))
 
+    def test_recovery_pass_assigns_over_ceiling_employee(self) -> None:
+        policy = self._policy(block_names=["Mid"], daily_boost={"Mon": 1})
+        policy["roles"]["Server"]["blocks"]["Mid"].update({"base": 1, "min": 1, "max": 1})
+        overflow_employee = self._add_employee("Over ceiling", ["Server"], desired_hours=2)
+
+        result = self._run_generator(policy)
+
+        monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
+        self.assertEqual(len(monday), 1)
+        self.assertEqual(monday[0].employee_id, overflow_employee.id)
+        self.assertFalse(any("No coverage" in warning for warning in result["warnings"]))
+
+    def test_budget_lock_does_not_warn(self) -> None:
+        policy = self._policy(block_names=["Close"], daily_boost={"Mon": 1}, role_name="Server - Dining Closer")
+        block = policy["roles"]["Server - Dining Closer"]["blocks"]["Close"]
+        block.update({"base": 1, "min": 1, "max": 1})
+        policy["roles"]["Server - Dining Closer"]["allow_cuts"] = False
+        policy["roles"]["Server - Dining Closer"]["hourly_wage"] = 30
+        policy["global"]["labor_budget_pct"] = 0.01
+        policy["global"]["labor_budget_tolerance_pct"] = 0.0
+        self._add_employee("Closer Only", ["Server - Dining Closer"], desired_hours=40)
+
+        result = self._run_generator(policy)
+
+        monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server - Dining Closer"]
+        self.assertEqual(len(monday), 2)
+        self.assertTrue(any(shift.location.lower() == "close" for shift in monday))
+        self.assertNotIn("Budget shortfall", " ".join(result["warnings"]))
+
+    def test_fifo_adjustment_resolves_preferred_order(self) -> None:
+        generator = ScheduleGenerator(self.session, self._policy(daily_boost={"Mon": 1}), actor="tests")
+        demand = BlockDemand(
+            day_index=0,
+            date=self.week_start,
+            start=datetime.datetime.combine(self.week_start, datetime.time(11, 0, tzinfo=datetime.timezone.utc)),
+            end=datetime.datetime.combine(self.week_start, datetime.time(17, 0, tzinfo=datetime.timezone.utc)),
+            role="Server",
+            block_name="Mid",
+            labels=["Mid"],
+            need=3,
+            priority=1.0,
+            minimum=0,
+            allow_cuts=True,
+            always_on=False,
+            role_group="Servers",
+            hourly_rate=10.0,
+        )
+        employees = [
+            {"assignments": {0: [(0, 60)]}},
+            {"assignments": {0: [(30, 90)]}},
+            {"assignments": {0: [(120, 180)]}},
+        ]
+        entries = [
+            ({"start": demand.start, "_followup_locked": False}, employees[0]),
+            ({"start": demand.start, "_followup_locked": False}, employees[1]),
+            ({"start": demand.start, "_followup_locked": False}, employees[2]),
+        ]
+        base_end = demand.start + datetime.timedelta(hours=6)
+        planned_end_times = [
+            base_end,
+            base_end - datetime.timedelta(hours=3),
+            base_end - datetime.timedelta(hours=2),
+        ]
+        start_minutes, _ = generator._demand_window_minutes(demand)
+        violations, locked_only = generator._fifo_violation_state(entries, planned_end_times, demand, start_minutes)
+        self.assertTrue(violations)
+        self.assertFalse(locked_only)
+        generator._rebalance_fifo_entries(
+            entries,
+            planned_end_times,
+            demand,
+            start_minutes,
+            datetime.timedelta(minutes=90),
+            violations,
+        )
+        after_violations, _ = generator._fifo_violation_state(entries, planned_end_times, demand, start_minutes)
+        self.assertFalse(after_violations)
+        self.assertTrue(all(planned_end_times[i] <= planned_end_times[i + 1] for i in range(len(planned_end_times) - 1)))
+
     # Helpers -----------------------------------------------------------------
 
     def _run_generator(self, policy: dict) -> dict:
-        engine = ScheduleGenerator(self.session, policy, actor="tests")
+        engine = ScheduleGenerator(self.session, policy, actor="tests", employee_session=self.employee_session)
         return engine.generate(self.week_start)
 
     def _policy(
@@ -377,13 +478,13 @@ class ScheduleGeneratorTests(unittest.TestCase):
                 "max_consecutive_days": 7,
                 "round_to_minutes": 15,
                 "allow_split_shifts": True,
-            "desired_hours_floor_pct": 0.85,
-            "desired_hours_ceiling_pct": 1.15,
-            "open_buffer_minutes": 30,
-            "close_buffer_minutes": 35,
-            "labor_budget_pct": 0.27,
-            "labor_budget_tolerance_pct": 0.08,
-        },
+                "desired_hours_floor_pct": 0.85,
+                "desired_hours_ceiling_pct": 1.15,
+                "open_buffer_minutes": 30,
+                "close_buffer_minutes": 35,
+                "labor_budget_pct": 0.27,
+                "labor_budget_tolerance_pct": 0.08,
+            },
             "timeblocks": {name: timeblocks[name] for name in block_names},
             "roles": {
                 role_name: {
@@ -392,6 +493,12 @@ class ScheduleGeneratorTests(unittest.TestCase):
                     "max_weekly_hours": 40,
                     "daily_boost": daily_boost or {},
                     "blocks": role_blocks,
+                }
+            },
+            "shift_presets": {
+                "Servers": {
+                    "am": [{"start": "11:00", "end": "16:00"}],
+                    "pm": [{"start": "16:00", "end": "22:00"}],
                 }
             },
         }
@@ -423,15 +530,21 @@ class ScheduleGeneratorTests(unittest.TestCase):
                 "max_consecutive_days": 7,
                 "round_to_minutes": 15,
                 "allow_split_shifts": True,
-            "desired_hours_floor_pct": 0.85,
-            "desired_hours_ceiling_pct": 1.15,
-            "open_buffer_minutes": 30,
-            "close_buffer_minutes": 35,
-            "labor_budget_pct": 0.27,
-            "labor_budget_tolerance_pct": 0.08,
-        },
+                "desired_hours_floor_pct": 0.85,
+                "desired_hours_ceiling_pct": 1.15,
+                "open_buffer_minutes": 30,
+                "close_buffer_minutes": 35,
+                "labor_budget_pct": 0.27,
+                "labor_budget_tolerance_pct": 0.08,
+            },
             "timeblocks": timeblocks,
             "roles": roles_payload,
+            "shift_presets": {
+                "Servers": {
+                    "am": [{"start": "11:00", "end": "16:00"}],
+                    "pm": [{"start": "16:00", "end": "22:00"}],
+                }
+            },
         }
 
     def _add_employee(
@@ -444,8 +557,8 @@ class ScheduleGeneratorTests(unittest.TestCase):
     ) -> Employee:
         employee = Employee(full_name=name, desired_hours=desired_hours, status="active", notes="")
         employee.role_list = roles
-        self.session.add(employee)
-        self.session.commit()
+        self.employee_session.add(employee)
+        self.employee_session.commit()
         if unavailability:
             for day_index, start_label, end_label in unavailability:
                 entry = EmployeeUnavailability(
@@ -454,8 +567,8 @@ class ScheduleGeneratorTests(unittest.TestCase):
                     start_time=self._time(start_label),
                     end_time=self._time(end_label),
                 )
-                self.session.add(entry)
-            self.session.commit()
+                self.employee_session.add(entry)
+            self.employee_session.commit()
         return employee
 
     def _shifts_for_day(self, weekday_index: int) -> list[Shift]:
@@ -480,13 +593,11 @@ class ScheduleGeneratorTests(unittest.TestCase):
         context = get_or_create_week_context(self.session, week.iso_year, week.iso_week, week.label)
         week.context_id = context.id
         self.session.commit()
-        projections = get_week_daily_projections(self.session, context.id)
-        mapping = {projection.day_of_week: projection for projection in projections}
-        for day_index, amount in values.items():
-            projection = mapping.get(day_index)
-            if projection is not None:
-                projection.projected_sales_amount = amount
-        self.session.commit()
+        payload = {
+            day_index: {"projected_sales_amount": amount, "projected_notes": ""}
+            for day_index, amount in values.items()
+        }
+        save_week_daily_projection_values(self.session, context.id, payload)
 
     @staticmethod
     def _time(label: str) -> datetime.time:
@@ -521,7 +632,13 @@ class GenerateApiTests(unittest.TestCase):
                     "policy_budget_ratio": 0.98,
                 },
             ]
-            result = api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=3)
+            result = api_generate_schedule_for_week(
+                session_factory,
+                datetime.date(2024, 4, 1),
+                "tester",
+                max_attempts=3,
+                employee_session_factory=session_factory,
+            )
             self.assertEqual(instance.generate.call_count, 2)
             self.assertEqual(result["shifts_created"], 4)
             self.assertEqual(result.get("attempts"), 2)
@@ -537,7 +654,13 @@ class GenerateApiTests(unittest.TestCase):
             instance = mock_engine.return_value
             instance.generate.side_effect = RuntimeError("boom")
             with self.assertRaises(RuntimeError) as context:
-                api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=2)
+                api_generate_schedule_for_week(
+                    session_factory,
+                    datetime.date(2024, 4, 1),
+                    "tester",
+                    max_attempts=2,
+                    employee_session_factory=session_factory,
+                )
             self.assertIn("after 2 attempts", str(context.exception))
             self.assertEqual(instance.generate.call_count, 2)
 
@@ -552,11 +675,30 @@ class GenerateApiTests(unittest.TestCase):
                 {"shifts_created": 8, "warnings": [], "projected_budget_total": 1200.0, "policy_budget_ratio": 0.6},
                 {"shifts_created": 10, "warnings": [], "projected_budget_total": 1200.0, "policy_budget_ratio": 0.7},
             ]
-            result = api_generate_schedule_for_week(session_factory, datetime.date(2024, 4, 1), "tester", max_attempts=3)
+            result = api_generate_schedule_for_week(
+                session_factory,
+                datetime.date(2024, 4, 1),
+                "tester",
+                max_attempts=3,
+                employee_session_factory=session_factory,
+            )
             self.assertEqual(result["shifts_created"], 10)
             self.assertEqual(result["attempts"], 3)
             self.assertTrue(any("budget target" in warning.lower() for warning in result.get("warnings", [])))
             self.assertAlmostEqual(result.get("policy_budget_ratio"), 0.7, places=3)
+
+
+class PolicyPresetTests(unittest.TestCase):
+    def test_shift_presets_are_copied_per_group(self) -> None:
+        kitchen_original = copy.deepcopy(SHIFT_PRESET_DEFAULTS["Kitchen"])
+        try:
+            self.assertEqual(SHIFT_PRESET_DEFAULTS["Servers"], SHIFT_PRESET_DEFAULTS["Kitchen"])
+            self.assertEqual(SHIFT_PRESET_DEFAULTS["Servers"], SHIFT_PRESET_DEFAULTS["Cashier"])
+            original_start = SHIFT_PRESET_DEFAULTS["Servers"]["am"][0]["start"]
+            SHIFT_PRESET_DEFAULTS["Kitchen"]["am"][0]["start"] = "10:00"
+            self.assertEqual(SHIFT_PRESET_DEFAULTS["Servers"]["am"][0]["start"], original_start)
+        finally:
+            SHIFT_PRESET_DEFAULTS["Kitchen"] = kitchen_original
 
 
 if __name__ == "__main__":

@@ -527,13 +527,48 @@ PATTERN_TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+SERVER_TEMPLATE = {
+    "am": [
+        {"start": "10:30", "end": "15:30"},
+        {"start": "10:45", "end": "15:45"},
+        {"start": "11:00", "end": "16:00"},
+        {"start": "11:15", "end": "16:15"},
+        {"start": "11:30", "end": "16:30"},
+        {"start": "11:45", "end": "16:45"},
+        {"start": "12:00", "end": "17:00"},
+        {"start": "12:30", "end": "17:30"},
+    ],
+    "pm": [
+        {"start": "15:30", "end": "21:30"},
+        {"start": "16:00", "end": "22:30"},
+        {"start": "16:15", "end": "22:45"},
+        {"start": "16:30", "end": "23:00"},
+        {"start": "17:00", "end": "23:30"},
+        {"start": "17:15", "end": "23:45"},
+        {"start": "17:30", "end": "24:30"},
+        {"start": "18:00", "end": "25:00"},
+    ],
+}
+
+SHIFT_PRESET_DEFAULTS: Dict[str, Dict[str, List[Dict[str, str]]]] = {
+    "Servers": copy.deepcopy(SERVER_TEMPLATE),
+    "Kitchen": copy.deepcopy(SERVER_TEMPLATE),
+    "Cashier": copy.deepcopy(SERVER_TEMPLATE),
+}
+
+SEASONAL_SETTINGS_DEFAULT: Dict[str, Any] = {"server_patio_enabled": True}
+
+SECTION_CAPACITY_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "Servers": {"Dining": 1.0, "Patio": 0.6, "Cocktail": 0.8},
+}
+
 
 ROLES: Dict[str, Dict[str, Any]] = {
     "Server - Dining": _role_config(
         wage=6.25,
         priority=1.0,
         max_weekly=38,
-        daily_boost={"Fri": 1, "Sat": 1, "Sun": -3},
+        daily_boost={"Tue": 1, "Thu": 1, "Fri": 1, "Sat": 1, "Sun": -3},
         thresholds=[
             {"metric": "demand_index", "gte": 0.65, "add": 1},
             {"metric": "demand_index", "gte": 1.0, "add": 1},
@@ -542,17 +577,27 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Open": _block_config(2, max_staff=3, per_sales=0.2, per_modifier=0.4),
             "Mid": _block_config(
                 2,
-                max_staff=7,
+                max_staff=6,
                 per_sales=0.32,
                 per_modifier=0.4,
-                floor_by_demand=[{"gte": 0.3, "min": 3}, {"gte": 0.6, "min": 4}, {"gte": 0.9, "min": 5}],
+                floor_by_demand=[
+                    {"gte": 0.3, "min": 3},
+                    {"gte": 0.6, "min": 4},
+                    {"gte": 0.9, "min": 5},
+                    {"gte": 1.1, "min": 6},
+                ],
             ),
             "PM": _block_config(
                 3,
-                max_staff=8,
+                max_staff=6,
                 per_sales=0.35,
                 per_modifier=0.5,
-                floor_by_demand=[{"gte": 0.3, "min": 4}, {"gte": 0.6, "min": 5}, {"gte": 0.9, "min": 6}],
+                floor_by_demand=[
+                    {"gte": 0.3, "min": 4},
+                    {"gte": 0.6, "min": 5},
+                    {"gte": 0.9, "min": 6},
+                    {"gte": 1.1, "min": 6},
+                ],
             ),
             "Close": _block_config(1, max_staff=3, per_sales=0.15, per_modifier=0.3),
         },
@@ -565,7 +610,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
         wage=6.75,
         priority=0.95,
         max_weekly=36,
-        daily_boost={"Thu": 1, "Fri": 1, "Sat": 1, "Sun": -3},
+        daily_boost={"Tue": 1, "Thu": 1, "Fri": 1, "Sat": 1, "Sun": -3},
         thresholds=[
             {"metric": "demand_index", "gte": 0.6, "add": 1},
             {"metric": "demand_index", "gte": 0.95, "add": 1},
@@ -574,23 +619,34 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Open": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
             "Mid": _block_config(
                 1,
-                max_staff=3,
+                max_staff=4,
                 per_sales=0.15,
                 per_modifier=0.3,
-                floor_by_demand=[{"gte": 0.3, "min": 1}, {"gte": 0.6, "min": 2}, {"gte": 0.9, "min": 3}],
+                floor_by_demand=[
+                    {"gte": 0.1, "min": 1},
+                    {"gte": 0.4, "min": 2},
+                    {"gte": 0.7, "min": 3},
+                    {"gte": 1.1, "min": 4},
+                ],
             ),
             "PM": _block_config(
                 2,
                 max_staff=4,
                 per_sales=0.25,
                 per_modifier=0.4,
-                floor_by_demand=[{"gte": 0.3, "min": 1}, {"gte": 0.6, "min": 2}, {"gte": 0.9, "min": 3}],
+                floor_by_demand=[
+                    {"gte": 0.1, "min": 1},
+                    {"gte": 0.6, "min": 2},
+                    {"gte": 0.85, "min": 3},
+                    {"gte": 1.05, "min": 4},
+                ],
             ),
             "Close": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
         },
         group="Servers",
         cut_buffer_minutes=35,
         covers=["Server - Dining", "Server - Patio"],
+        always_on=True,
     ),
     "Server - Patio": _role_config(
         wage=6.0,
@@ -612,12 +668,24 @@ ROLES: Dict[str, Dict[str, Any]] = {
         cut_buffer_minutes=30,
         covers=["Server - Dining", "Server - Cocktail"],
     ),
+    "Server - Training": _role_config(
+        wage=5.5,
+        priority=0.4,
+        max_weekly=25,
+        blocks={
+            "Mid": _block_config(0, max_staff=1),
+            "PM": _block_config(0, max_staff=1),
+        },
+        group="Servers",
+        cut_buffer_minutes=20,
+        covers=["Server - Dining", "Server - Cocktail"],
+    ),
     "Server - Dining Closer": _role_config(
         wage=6.75,
         priority=1.05,
         max_weekly=35,
         daily_boost={"Thu": 1, "Fri": 1, "Sat": 1},
-        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1, start="@close-240", end="@close+45")},
         group="Servers",
         allow_cuts=False,
         cut_buffer_minutes=5,
@@ -628,7 +696,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
         priority=1.0,
         max_weekly=35,
         daily_boost={"Thu": 1, "Fri": 1, "Sat": 1},
-        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1, start="@close-240", end="@close+45")},
         group="Servers",
         allow_cuts=False,
         cut_buffer_minutes=5,
@@ -638,12 +706,18 @@ ROLES: Dict[str, Dict[str, Any]] = {
         wage=10.0,
         priority=0.98,
         max_weekly=40,
-        daily_boost={"Sun": -2},
+        daily_boost={"Fri": 1, "Sat": 1, "Sun": -2},
         thresholds=[{"metric": "demand_index", "gte": 0.75, "add": 1}],
         blocks={
             "Open": _block_config(1, max_staff=2, per_sales=0.05, per_modifier=0.1),
             "Mid": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
-            "PM": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
+            "PM": _block_config(
+                1,
+                max_staff=2,
+                per_sales=0.15,
+                per_modifier=0.3,
+                floor_by_demand=[{"gte": 0.85, "min": 2}],
+            ),
             "Close": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
         },
         group="Bartenders",
@@ -655,34 +729,46 @@ ROLES: Dict[str, Dict[str, Any]] = {
         wage=11.0,
         priority=1.05,
         max_weekly=40,
-        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1, start="@close-240", end="@close+60")},
         group="Bartenders",
         allow_cuts=False,
         always_on=True,
         cut_buffer_minutes=0,
         covers=["Bartender"],
     ),
+    "Bartender - Training": _role_config(
+        wage=9.0,
+        priority=0.45,
+        max_weekly=24,
+        blocks={
+            "Mid": _block_config(0, max_staff=1),
+            "PM": _block_config(0, max_staff=1),
+        },
+        group="Bartenders",
+        cut_buffer_minutes=15,
+        covers=["Bartender"],
+    ),
     "Cashier": _role_config(
         wage=15.0,
         priority=0.9,
         max_weekly=35,
-        daily_boost={"Sun": -2},
+        daily_boost={"Fri": 1, "Sat": 1, "Sun": -2},
         thresholds=[],
         blocks={
             "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.02),
             "Mid": _block_config(
                 1,
                 min_staff=1,
-                max_staff=2,
+                max_staff=3,
                 per_sales=0.12,
-                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+                floor_by_demand=[{"gte": 0.4, "min": 1}, {"gte": 0.85, "min": 2}, {"gte": 1.05, "min": 3}],
             ),
             "PM": _block_config(
                 1,
                 min_staff=1,
-                max_staff=2,
+                max_staff=3,
                 per_sales=0.18,
-                floor_by_demand=[{"gte": 0.5, "min": 1}, {"gte": 0.9, "min": 2}],
+                floor_by_demand=[{"gte": 0.4, "min": 1}, {"gte": 0.8, "min": 2}, {"gte": 1.0, "min": 3}],
             ),
             "Close": _block_config(0, min_staff=0, max_staff=0, per_sales=0.0),
         },
@@ -716,6 +802,18 @@ ROLES: Dict[str, Dict[str, Any]] = {
         group="Cashier",
         cut_buffer_minutes=25,
         covers=["Cashier", "Host"],
+    ),
+    "Cashier - Training": _role_config(
+        wage=13.0,
+        priority=0.35,
+        max_weekly=24,
+        blocks={
+            "Mid": _block_config(0, max_staff=1),
+            "PM": _block_config(0, max_staff=1),
+        },
+        group="Cashier",
+        cut_buffer_minutes=15,
+        covers=["Cashier", "Cashier - To-Go Specialist"],
     ),
     "Host": _role_config(
         wage=14.0,
@@ -888,11 +986,23 @@ ROLES: Dict[str, Dict[str, Any]] = {
         priority=0.87,
         max_weekly=38,
         daily_boost={"Sun": -2},
-        blocks={"Close": _block_config(1, max_staff=2)},
+        blocks={"Close": _block_config(1, max_staff=2, start="@close-300", end="@close+60")},
         group="Kitchen",
         allow_cuts=False,
         cut_buffer_minutes=0,
         covers=["Prep", "Chip", "Shake"],
+    ),
+    "Kitchen - Training": _role_config(
+        wage=17.0,
+        priority=0.5,
+        max_weekly=28,
+        blocks={
+            "Mid": _block_config(0, max_staff=1),
+            "PM": _block_config(0, max_staff=1),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=20,
+        covers=["Expo", "Grill", "Chip", "Shake"],
     ),
 }
 
@@ -902,7 +1012,52 @@ ROLE_GROUP_ALLOCATIONS: Dict[str, Dict[str, Any]] = {
     "Servers": {"allocation_pct": 0.39, "allow_cuts": True, "cut_buffer_minutes": 35},
     "Bartenders": {"allocation_pct": 0.12, "allow_cuts": False, "always_on": True, "cut_buffer_minutes": 0},
     "Cashier": {"allocation_pct": 0.15, "allow_cuts": True, "cut_buffer_minutes": 25},
+    "Management": {"allocation_pct": 0.0, "allow_cuts": True, "cut_buffer_minutes": 30},
 }
+
+CUT_PRIORITY_DEFAULT: Dict[str, Any] = {
+    "enabled": False,
+    "include_unlisted": True,
+    "sequence": [
+        {
+            "group": "Servers",
+            "roles": [
+                "Server - Dining",
+                "Server - Dining Opener",
+                "Server - Dining Preclose",
+                "Server - Dining Closer",
+            ],
+        },
+        {"group": "Kitchen", "roles": []},
+        {
+            "group": "Cashier",
+            "roles": ["Cashier", "Cashier - To-Go Specialist", "Host"],
+        },
+        {
+            "group": "Servers",
+            "roles": [
+                "Server - Cocktail",
+                "Server - Cocktail Opener",
+                "Server - Cocktail Preclose",
+                "Server - Cocktail Closer",
+            ],
+        },
+    ],
+    "role_order": {
+        "Servers": [
+            "Server - Patio",
+            "Server - Dining",
+            "Server - Cocktail",
+            "Server - Dining Opener",
+            "Server - Cocktail Opener",
+            "Server - Dining Closer",
+            "Server - Cocktail Closer",
+        ],
+        "Kitchen": ["Expo", "Grill", "Chip", "Shake", "Prep"],
+        "Cashier": ["Cashier", "Cashier - To-Go Specialist", "Host"],
+    },
+}
+
 
 ANCHOR_RULES: Dict[str, Any] = {
     "openers": {"Kitchen": 1, "Servers": 1, "Bartenders": 1, "Cashier": 0},
@@ -929,6 +1084,8 @@ ANCHOR_RULES: Dict[str, Any] = {
     "allow_cashier_closer": False,
     # Controls FIFO/LILO bias for open/close patterns: "off", "prefer", "enforce".
     "open_close_order": "prefer",
+    # Optional cut rotation + role ordering configuration.
+    "cut_priority": CUT_PRIORITY_DEFAULT,
 }
 
 
@@ -954,6 +1111,9 @@ BASELINE_POLICY: Dict[str, Any] = {
     "anchors": ANCHOR_RULES,
     "role_groups": ROLE_GROUP_ALLOCATIONS,
     "pattern_templates": PATTERN_TEMPLATES,
+    "seasonal_settings": SEASONAL_SETTINGS_DEFAULT,
+    "shift_presets": SHIFT_PRESET_DEFAULTS,
+    "section_capacity": SECTION_CAPACITY_DEFAULTS,
     "roles": ROLES,
 }
 

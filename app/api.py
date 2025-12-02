@@ -24,6 +24,7 @@ if str(APP_DIR) not in sys.path:
 import database  # noqa: E402
 from database import (  # noqa: E402
     SessionLocal,
+    EmployeeSessionLocal,
     Modifier,
     WeekContext,
     WeekDailyProjection,
@@ -42,6 +43,7 @@ from generator.api import generate_schedule_for_week  # noqa: E402
 from database import Policy, upsert_policy, Employee  # noqa: E402
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
+from validation import validate_week_schedule  # noqa: E402
 
 
 app = FastAPI(title="Schedule Assistant API", version="0.1")
@@ -49,6 +51,14 @@ app = FastAPI(title="Schedule Assistant API", version="0.1")
 
 def get_db():
     db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_employee_db():
+    db = EmployeeSessionLocal()
     try:
         yield db
     finally:
@@ -114,12 +124,28 @@ def week_shifts(
     role: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     db=Depends(get_db),
+    employee_db=Depends(get_employee_db),
 ) -> JSONResponse:
     start_date = _parse_week_start(week_start)
-    shifts = get_shifts_for_week(db, start_date, employee_id=employee_id, role=role, status=status)
+    shifts = get_shifts_for_week(
+        db,
+        start_date,
+        employee_id=employee_id,
+        role=role,
+        status=status,
+        employee_session=employee_db,
+    )
     return JSONResponse(
         content=jsonable_encoder({"week_start": start_date.isoformat(), "shifts": _serialize_shifts(shifts)})
     )
+
+
+@app.get("/api/v1/schedules/{week_start}/validate")
+def validate_schedule_endpoint(week_start: str, db=Depends(get_db)) -> JSONResponse:
+    start_date = _parse_week_start(week_start)
+    with EmployeeSessionLocal() as employee_db:
+        report = validate_week_schedule(db, start_date, employee_session=employee_db)
+    return JSONResponse(content=jsonable_encoder(report))
 
 
 @app.post("/api/v1/weeks/{week_start}/projection")
@@ -226,7 +252,12 @@ def generate_schedule(payload: Dict[str, Any], db=Depends(get_db)) -> JSONRespon
         raise HTTPException(status_code=400, detail="weekStart is required")
     start_date = _parse_week_start(str(week_start_raw))
     try:
-        result = generate_schedule_for_week(SessionLocal, start_date, actor)
+        result = generate_schedule_for_week(
+            SessionLocal,
+            start_date,
+            actor,
+            employee_session_factory=EmployeeSessionLocal,
+        )
     except Exception as exc:  # pragma: no cover - surface generator errors
         raise HTTPException(status_code=500, detail=f"schedule generation failed: {exc}") from exc
     return JSONResponse(content=jsonable_encoder(result))
@@ -283,8 +314,9 @@ def update_employee_roles_wages(
     employee_id: int,
     payload: Dict[str, Any],
     db=Depends(get_db),
+    employee_db=Depends(get_employee_db),
 ) -> JSONResponse:
-    employee: Optional[Employee] = db.get(Employee, employee_id)
+    employee: Optional[Employee] = employee_db.get(Employee, employee_id)
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     roles = payload.get("roles") or []
@@ -299,8 +331,8 @@ def update_employee_roles_wages(
             pass
     if status:
         employee.status = str(status)
-    db.commit()
-    db.refresh(employee)
+    employee_db.commit()
+    employee_db.refresh(employee)
     _audit(
         db,
         actor=payload.get("actor") or "api",

@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 from policy import build_default_policy
-from roles import ROLE_GROUPS
+from roles import ROLE_GROUPS, normalize_role
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 WAGES_FILE = DATA_DIR / "role_wages.json"
+ALLOW_ZERO_ROLES = {"mgr - foh"}
 
 
 def _defined_roles() -> Iterable[str]:
@@ -26,7 +27,11 @@ def baseline_wages() -> Dict[str, Dict[str, Any]]:
     for role in _defined_roles():
         spec = roles.get(role) if isinstance(roles, dict) else {}
         wage = float(spec.get("hourly_wage", 0.0) if isinstance(spec, dict) else 0.0)
-        payload[role] = {"wage": round(max(0.0, wage), 2), "confirmed": False}
+        normalized = normalize_role(role)
+        payload[role] = {
+            "wage": round(max(0.0, wage), 2),
+            "confirmed": normalized in ALLOW_ZERO_ROLES,
+        }
     return payload
 
 
@@ -71,6 +76,7 @@ def wage_amounts() -> Dict[str, float]:
 
 def validate_wages(roles: Iterable[str]) -> Dict[str, str]:
     """Return dict of roles missing confirmed wages -> reason."""
+    allow_zero = ALLOW_ZERO_ROLES
     data = load_wages()
     problems: Dict[str, str] = {}
     for role in roles:
@@ -82,11 +88,15 @@ def validate_wages(roles: Iterable[str]) -> Dict[str, str]:
             wage = float(entry.get("wage", 0.0) or 0.0)
         except (TypeError, ValueError):
             wage = 0.0
-        if wage <= 0.0:
+        normalized = normalize_role(role)
+        if wage <= 0.0 and normalized not in allow_zero:
             problems[role] = "wage is zero"
             continue
         if not entry.get("confirmed", False):
-            problems[role] = "not confirmed"
+            if normalized not in allow_zero:
+                problems[role] = "not confirmed"
+            else:
+                problems[role] = "confirm salary role"
     return problems
 
 
@@ -113,7 +123,7 @@ def import_wages(source: Path) -> int:
             except (TypeError, ValueError):
                 pass
         if "confirmed" in entry:
-            record["confirmed"] = bool(entry["confirmed"])
+            record["confirmed"] = bool(entry["confirmed"]) or normalize_role(role) in ALLOW_ZERO_ROLES
         count += 1
     save_wages(normalized)
     return count

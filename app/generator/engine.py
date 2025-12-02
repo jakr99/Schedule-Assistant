@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import math
 import random
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
@@ -20,10 +21,12 @@ from database import (
     get_week_daily_projections,
     list_modifiers_for_week,
     record_audit_log,
+    get_employee_role_wages,
     upsert_shift,
 )
 from policy import (
     PATTERN_TEMPLATES,
+    SHIFT_PRESET_DEFAULTS,
     anchor_rules,
     build_default_policy,
     close_minutes,
@@ -39,6 +42,38 @@ from roles import is_manager_role, normalize_role, role_matches, role_group
 
 UTC = datetime.timezone.utc
 WEEKDAY_TOKENS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+HALF_HOUR = datetime.timedelta(minutes=30)
+LABOR_PER_100_SALES = {"Servers": 0.18, "Bartenders": 0.05, "Kitchen": 0.2, "Cashier": 0.06}
+MIN_STAFF_DEFAULTS = {"Servers": 1, "Server": 1, "Bartenders": 1, "Bartender": 1, "Kitchen": 2, "Cashier": 0}
+SHIFT_TEMPLATE_CONFIG = {
+    "Servers": [
+        {"style": "Open", "time": "open-00:45", "hours": 7.5},
+        {"style": "Lunch", "time": "11:00", "hours": 5.5},
+        {"style": "Shoulder", "time": "14:00", "hours": 5.0},
+        {"style": "Dinner", "time": "17:00", "hours": 6.5},
+        {"style": "Late", "time": "20:00", "hours": 6.0},
+    ],
+    "Bartenders": [
+        {"style": "Open", "time": "open-00:45", "hours": 8.0},
+        {"style": "Mid", "time": "12:00", "hours": 6.0},
+        {"style": "Dinner", "time": "17:00", "hours": 6.5},
+        {"style": "Late", "time": "20:30", "hours": 6.0},
+    ],
+    "Kitchen": [
+        {"style": "Prep", "time": "open-00:30", "hours": 8.0},
+        {"style": "Mid", "time": "11:30", "hours": 6.5},
+        {"style": "Dinner", "time": "17:00", "hours": 7.0},
+        {"style": "Late", "time": "20:00", "hours": 6.0},
+    ],
+    "Cashier": [
+        {"style": "Open", "time": "open-00:30", "hours": 6.0},
+        {"style": "Dinner", "time": "17:00", "hours": 5.5},
+        {"style": "Late", "time": "20:00", "hours": 5.0},
+    ],
+}
+SHIFT_STYLE_ORDER = {"Open": 0, "Prep": 0, "Lunch": 1, "Mid": 1, "Shoulder": 2, "Dinner": 3, "Late": 4}
+MIN_SHIFT_HOURS = 4.0
+MAX_SHIFT_HOURS = 9.0
 
 
 @dataclass
@@ -59,6 +94,8 @@ class BlockDemand:
     hourly_rate: float = 0.0
     recommended_cut: Optional[datetime.datetime] = None
     max_capacity: int = 0
+    cut_score: float = 0.0
+    cut_factors: Dict[str, float] = field(default_factory=dict)
 
     @property
     def duration_hours(self) -> float:
@@ -74,8 +111,10 @@ class ScheduleGenerator:
         wage_overrides: Optional[Dict[str, float]] = None,
         *,
         cut_relax_level: int = 0,
+        employee_session=None,
     ) -> None:
         self.session = session
+        self.employee_session = employee_session
         self.policy = policy or {}
         self.actor = actor or "system"
         self.wage_overrides = wage_overrides or {}
@@ -108,6 +147,7 @@ class ScheduleGenerator:
         if labor_tol > 1.0:
             labor_tol /= 100.0
         self.labor_budget_tolerance = self._clamp(labor_tol, 0.0, 0.5)
+        self.budget_target_ratio = max(0.75, 1.0 - (self.labor_budget_tolerance / 2.0))
 
         self.employees: List[Dict[str, Any]] = []
         self.modifiers_by_day: Dict[int, List[Dict[str, Any]]] = {}
@@ -115,21 +155,22 @@ class ScheduleGenerator:
         self.role_group_settings: Dict[str, Dict[str, Any]] = self._load_role_group_settings()
         self.group_budget_by_day: List[Dict[str, float]] = []
         self.warnings: List[str] = []
+        self.cut_insights: List[Dict[str, Any]] = []
+        self.unfilled_slots: List[Dict[str, Any]] = []
         self.interchangeable_groups: Set[str] = {"Cashier"}
         self.random = random.Random()
         self.group_pressure: Dict[int, Dict[str, float]] = {}
-        self.cut_priority_rank: Dict[str, int] = {
-            "Cashier": 0,
-            "Servers": 1,
-            "Kitchen": 2,
-            "Bartenders": 3,
-            "Other": 2,
-        }
+        self.group_aliases = {"heart of house": "Kitchen", "cashier & takeout": "Cashier"}
         self.trim_aggressive_ratio: float = float(global_cfg.get("trim_aggressive_ratio", 1.0) or 1.0)
         self.anchors = anchor_rules(self.policy)
         order_mode = (self.anchors.get("open_close_order") or "prefer").strip().lower()
         self.open_close_order_mode = order_mode if order_mode in {"off", "prefer", "enforce"} else "prefer"
-        self.group_aliases = {"heart of house": "Kitchen", "cashier & takeout": "Cashier"}
+        self.cut_priority_settings = self._load_cut_priority_settings()
+        self.cut_priority_rank: Dict[str, int] = self._build_cut_priority_rank()
+        section_capacity = self.policy.get("section_capacity") if isinstance(self.policy, dict) else {}
+        self.section_capacity: Dict[str, Dict[str, float]] = (
+            section_capacity if isinstance(section_capacity, dict) else {}
+        )
         self.non_cuttable_roles: Set[str] = {
             normalize_role(role) for role in (self.anchors.get("non_cuttable_roles") or [])
         }
@@ -139,6 +180,9 @@ class ScheduleGenerator:
             self.pattern_templates = raw_patterns
         else:
             self.pattern_templates = PATTERN_TEMPLATES
+        self.shift_presets = self.policy.get("shift_presets") if isinstance(self.policy, dict) else {}
+        if not isinstance(self.shift_presets, dict) or not self.shift_presets:
+            self.shift_presets = copy.deepcopy(SHIFT_PRESET_DEFAULTS)
 
     @staticmethod
     def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -170,6 +214,7 @@ class ScheduleGenerator:
                 "days": [],
                 "total_cost": 0.0,
                 "warnings": ["Active policy does not define any eligible roles. Unable to generate schedule."],
+                "cut_insights": [],
             }
 
         week = get_or_create_week(self.session, week_start_date)
@@ -188,8 +233,11 @@ class ScheduleGenerator:
         self.modifiers_by_day = self._load_modifiers(week.week_start_date)
         self.day_contexts = self._build_day_contexts(context, week.week_start_date)
         self.group_budget_by_day = self._build_group_budgets()
+        self.cut_insights.clear()
         demands = self._compute_block_demands(week.week_start_date)
         assignments = self._assign(demands)
+        self._apply_budget_cuts(assignments, demands)
+        self._retry_unfilled_assignments(assignments)
         self._enforce_shift_continuity(assignments, week.week_start_date)
         self._warn_unpaired_openers()
 
@@ -215,6 +263,7 @@ class ScheduleGenerator:
         self.session.execute(delete(Shift).where(Shift.week_id == week.id))
         week.status = "draft"
         self.session.commit()
+        self.unfilled_slots = []
 
     def _load_employee_profiles(self) -> List[Dict[str, Any]]:
         stmt = (
@@ -225,7 +274,10 @@ class ScheduleGenerator:
         )
         employees: List[Dict[str, Any]] = []
         self.employee_lookup: Dict[int, Dict[str, Any]] = {}
-        for employee in self.session.scalars(stmt):
+        source = self.employee_session or self.session
+        rows = list(source.scalars(stmt))
+        wage_overrides = get_employee_role_wages(self.employee_session or self.session, [emp.id for emp in rows if emp.id])
+        for employee in rows:
             role_set = {role.strip() for role in employee.role_list if role.strip()}
             if not role_set:
                 continue
@@ -256,6 +308,7 @@ class ScheduleGenerator:
                 "last_day_index": None,
                 "consecutive_days": 0,
                 "pending_open_links": {idx: [] for idx in range(7)},
+                "wage_overrides": wage_overrides.get(employee.id, {}),
             }
             employees.append(record)
             if employee.id is not None:
@@ -301,6 +354,90 @@ class ScheduleGenerator:
         if not mapping:
             mapping = build_default_policy().get("role_groups", {})
         return mapping
+
+    def _load_cut_priority_settings(self) -> Dict[str, Any]:
+        """Normalize cut rotation + role ordering rules from the policy."""
+        spec = self.anchors.get("cut_priority") if isinstance(self.anchors, dict) else {}
+        settings: Dict[str, Any] = {
+            "enabled": False,
+            "include_unlisted": True,
+            "sequence": [],
+            "role_order": {},
+        }
+        if not isinstance(spec, dict):
+            return settings
+        settings["include_unlisted"] = bool(spec.get("include_unlisted", True))
+        settings["enabled"] = bool(spec.get("enabled", False))
+
+        raw_sequence = spec.get("sequence")
+        normalized_sequence: List[Dict[str, Any]] = []
+        if isinstance(raw_sequence, list):
+            for entry in raw_sequence:
+                normalized = self._normalize_cut_sequence_entry(entry)
+                if normalized:
+                    normalized_sequence.append(normalized)
+        settings["sequence"] = normalized_sequence
+        if not normalized_sequence:
+            settings["enabled"] = False
+
+        role_order_spec = spec.get("role_order")
+        normalized_order: Dict[str, List[str]] = {}
+        if isinstance(role_order_spec, dict):
+            for group_name, roles in role_order_spec.items():
+                canonical = self._canonical_group(group_name)
+                normalized_roles = self._normalize_role_list(roles if isinstance(roles, list) else [roles])
+                if canonical and normalized_roles:
+                    normalized_order[canonical] = normalized_roles
+        if "Servers" not in normalized_order:
+            normalized_order["Servers"] = self._server_cut_preference()
+        settings["role_order"] = normalized_order
+        return settings
+
+    def _normalize_cut_sequence_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        group_label = ""
+        roles_field: List[Any] = []
+        if isinstance(entry, str):
+            if ":" in entry:
+                group_label, role_part = entry.split(":", 1)
+                roles_field = [role_part.strip()]
+            else:
+                group_label = entry
+        elif isinstance(entry, dict):
+            group_label = entry.get("group") or entry.get("name") or ""
+            if isinstance(entry.get("roles"), list):
+                roles_field = entry.get("roles")
+            elif isinstance(entry.get("role"), str):
+                roles_field = [entry.get("role")]
+        if not group_label:
+            return None
+        canonical_group = self._canonical_group(group_label)
+        normalized_roles = self._normalize_role_list(roles_field)
+        return {"group": canonical_group, "roles": normalized_roles}
+
+    @staticmethod
+    def _normalize_role_list(values: Iterable[Any]) -> List[str]:
+        seen: Set[str] = set()
+        normalized: List[str] = []
+        for value in values:
+            label = normalize_role(value)
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            normalized.append(label)
+        return normalized
+
+    def _build_cut_priority_rank(self) -> Dict[str, int]:
+        """Convert the configured rotation into a numeric rank for earlier pull weighting."""
+        base = {"Cashier": 0, "Servers": 1, "Kitchen": 2, "Bartenders": 3, "Other": 2}
+        sequence = self.cut_priority_settings.get("sequence") or []
+        assigned: Set[str] = set()
+        for idx, entry in enumerate(sequence):
+            group = entry.get("group")
+            if not group or group in assigned:
+                continue
+            base[group] = idx
+            assigned.add(group)
+        return base
 
     @staticmethod
     def _parse_allocation_pct(value: Any) -> float:
@@ -408,120 +545,137 @@ class ScheduleGenerator:
             total += (window["pct"] / 100.0) * max(fraction, 0.1)
         return max(0.5, 1.0 + total)
 
-    def _compute_block_demands(self, week_start: datetime.date) -> List[BlockDemand]:
-        demands: List[BlockDemand] = []
+    def _compute_block_demands(self, week_start: datetime.date) -> Dict[Tuple[int, str], Dict[str, Any]]:
+        """
+        Build a half-hour demand matrix per day and role group from projected sales.
+        Coverage scales with adjusted sales, applies day-of-week/event weights, and
+        enforces role minima so downstream shifts stay smooth around transitions.
+        """
+        matrix: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        roles_by_group = self._roles_by_group()
         for day_index in range(7):
             date_value = week_start + datetime.timedelta(days=day_index)
-            for role_name, role_cfg in self.roles_config.items():
-                if not role_cfg.get("enabled", True):
+            day_start = datetime.datetime.combine(date_value, datetime.time.min, tzinfo=UTC)
+            open_min = open_minutes(self.policy, date_value)
+            close_min = close_minutes(self.policy, date_value)
+            if close_min <= open_min:
+                close_min += 24 * 60
+            open_dt = day_start + datetime.timedelta(minutes=open_min)
+            close_dt = day_start + datetime.timedelta(minutes=close_min)
+            slots: List[Dict[str, Any]] = []
+            slot_start = open_dt
+            while slot_start < close_dt:
+                slot_end = min(slot_start + HALF_HOUR, close_dt)
+                slots.append({"start": slot_start, "end": slot_end})
+                slot_start = slot_end
+            ctx = self.day_contexts[day_index] if 0 <= day_index < len(self.day_contexts) else {}
+            notes = ctx.get("notes", {}) if isinstance(ctx, dict) else {}
+            adjusted_sales = float(ctx.get("sales", 0.0) or 0.0) * float(ctx.get("modifier_multiplier", 1.0) or 1.0)
+            weights = self._slot_sales_weights(day_index, slots, notes)
+            total_weight = sum(weights) or 1.0
+            for group_name, role_names in roles_by_group.items():
+                if not role_names:
                     continue
-                block_targets = role_cfg.get("blocks") or {}
-                group_name = self._role_group_name(role_name, role_cfg)
-                group_defaults = self.role_group_settings.get(group_name, {})
-                allow_cuts = bool(role_cfg.get("allow_cuts", group_defaults.get("allow_cuts", True)))
-                always_on = bool(role_cfg.get("always_on", group_defaults.get("always_on", False)))
-                for block_name, block_cfg in block_targets.items():
-                    block_label = (block_name or "").strip().lower()
-                    if block_label == "open" and not self._role_allows_open_shift(role_name):
-                        continue
-                    overrides: Dict[str, str] = {}
-                    if isinstance(block_cfg, dict):
-                        custom_start = block_cfg.get("start")
-                        custom_end = block_cfg.get("end")
-                        if custom_start:
-                            overrides["start"] = str(custom_start)
-                        if custom_end:
-                            overrides["end"] = str(custom_end)
-                    resolved = resolve_policy_block(
-                        self.policy,
-                        block_name,
-                        date_value,
-                        overrides=overrides or None,
+                min_staff = self._minimum_staff_for_group(group_name)
+                labor_ratio = LABOR_PER_100_SALES.get(group_name, 0.12)
+                targets: List[int] = []
+                minima: List[int] = []
+                for weight, slot in zip(weights, slots):
+                    sales_for_slot = adjusted_sales * (weight / total_weight)
+                    hours_needed = (sales_for_slot / 100.0) * labor_ratio
+                    target = int(round(hours_needed / 0.5))
+                    target = max(min_staff, target)
+                    targets.append(target)
+                    minima.append(min_staff)
+                smoothed = self._smooth_targets(targets, minima)
+                slot_records: List[Dict[str, Any]] = []
+                for idx, slot in enumerate(slots):
+                    slot_records.append(
+                        {
+                            "day_index": day_index,
+                            "date": date_value,
+                            "start": slot["start"],
+                            "end": slot["end"],
+                            "role_group": group_name,
+                            "target": smoothed[idx],
+                            "minimum": minima[idx],
+                        }
                     )
-                    if not resolved:
-                        continue
-                    _, start_dt, end_dt = resolved
-                    start_dt, end_dt = self._adjust_block_window(role_name, block_name, date_value, start_dt, end_dt)
-                    pattern_windows = self._pattern_windows(
-                        role_name,
-                        date_value,
-                        block_label,
-                        anchor_start=start_dt,
-                        anchor_end=end_dt,
-                    )
-                    need, minimum, max_staff = self._calculate_block_need(
-                        role_name, role_cfg, block_cfg, block_name, day_index
-                    )
-                    if need <= 0:
-                        continue
-                    rate = self._role_wage(role_name)
-                    labels = [block_name]
-                    if pattern_windows:
-                        windows = pattern_windows
-                        slots = need
-                        mins = minimum
-                        max_slots = max(max_staff, need)
-                        count = len(windows)
-                        base_each = slots // count
-                        remainder = slots % count
-                        min_each = mins // count
-                        min_rem = mins % count
-                        max_each = max_slots // count
-                        max_rem = max_slots % count
-                        for idx, (p_start, p_end) in enumerate(windows):
-                            slot_need = base_each + (1 if idx < remainder else 0)
-                            slot_min = min_each + (1 if idx < min_rem else 0)
-                            slot_max = max_each + (1 if idx < max_rem else 0)
-                            if slot_need <= 0 and slot_min <= 0:
-                                continue
-                            slot_need = max(slot_need, slot_min)
-                            slot_max = max(slot_need, slot_max)
-                            demand_labels = list(labels)
-                            demands.append(
-                                BlockDemand(
-                                    day_index=day_index,
-                                    date=date_value,
-                                    start=p_start,
-                                    end=p_end,
-                                    role=role_name,
-                                    block_name=block_name,
-                                    labels=demand_labels,
-                                    need=slot_need,
-                                    priority=float(role_cfg.get("priority", 1.0)),
-                                    minimum=slot_min,
-                                    allow_cuts=allow_cuts,
-                                    always_on=always_on,
-                                    role_group=group_name,
-                                    hourly_rate=rate,
-                                    max_capacity=slot_max,
-                                )
-                            )
-                    else:
-                        demands.append(
-                            BlockDemand(
-                                day_index=day_index,
-                                date=date_value,
-                                start=start_dt,
-                                end=end_dt,
-                                role=role_name,
-                                block_name=block_name,
-                                labels=labels,
-                                need=need,
-                                priority=float(role_cfg.get("priority", 1.0)),
-                                minimum=minimum,
-                                allow_cuts=allow_cuts,
-                                always_on=always_on,
-                                role_group=group_name,
-                                hourly_rate=rate,
-                                max_capacity=max_staff,
-                            )
-                        )
-        self._enforce_anchor_shift_caps(demands)
-        self._apply_labor_allocations(demands)
-        self._boost_under_budget_groups(demands)
-        self._record_group_pressure(demands)
-        self._annotate_cut_windows(demands)
-        return demands
+                matrix[(day_index, group_name)] = {"slots": slot_records, "open": open_dt, "close": close_dt}
+        self.current_slot_matrix = matrix
+        return matrix
+
+    def _roles_by_group(self) -> Dict[str, List[str]]:
+        mapping: Dict[str, List[str]] = defaultdict(list)
+        for role_name, cfg in self.roles_config.items():
+            if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+                continue
+            group_name = self._role_group_name(role_name, cfg)
+            mapping[group_name].append(role_name)
+        return mapping
+
+    def _minimum_staff_for_group(self, group_name: str) -> int:
+        canonical = self._canonical_group(group_name)
+        return max(0, int(MIN_STAFF_DEFAULTS.get(canonical, MIN_STAFF_DEFAULTS.get(group_name, 1))))
+
+    def _slot_sales_weights(
+        self, day_index: int, slots: List[Dict[str, Any]], notes: Dict[str, Any]
+    ) -> List[float]:
+        """
+        Estimate a time-of-day sales curve: lunch -> shoulder -> dinner -> late night.
+        Event notes (BOGO/UFC/football) lift the relevant windows to keep coverage smooth.
+        """
+        if not slots:
+            return []
+        span_minutes = max(1.0, (slots[-1]["end"] - slots[0]["start"]).total_seconds() / 60.0)
+        demand_index = 1.0
+        if 0 <= day_index < len(self.day_contexts):
+            demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
+        dow = WEEKDAY_TOKENS[day_index]
+        is_weekend = dow in {"Fri", "Sat"}
+        note_text = json.dumps(notes).lower() if notes else ""
+
+        def bump(progress: float, center: float, width: float, amplitude: float) -> float:
+            return amplitude * math.exp(-((progress - center) ** 2) / max(width, 1e-3))
+
+        weights: List[float] = []
+        for slot in slots:
+            minutes_from_open = (slot["start"] - slots[0]["start"]).total_seconds() / 60.0
+            progress = minutes_from_open / span_minutes
+            base = 0.15
+            base += bump(progress, 0.32, 0.028, 0.9)  # lunch peak
+            base += bump(progress, 0.55, 0.045, 0.5)  # shoulder
+            base += bump(progress, 0.72, 0.03, 1.3)  # dinner
+            base += bump(progress, 0.9, 0.06, 0.45)  # late night
+            if is_weekend:
+                base *= 1.12
+                base += bump(progress, 0.82, 0.05, 0.35)
+            if dow == "Sun":
+                base += bump(progress, 0.58, 0.04, 0.3)
+            if "bogo" in note_text:
+                base += bump(progress, 0.7, 0.035, 0.4)
+            if "ufc" in note_text or "fight" in note_text:
+                base += bump(progress, 0.92, 0.04, 0.6)
+            if "football" in note_text or "nfl" in note_text:
+                base += bump(progress, 0.6, 0.05, 0.35)
+            weights.append(max(0.05, base * demand_index))
+        return weights
+
+    def _smooth_targets(self, targets: List[int], minima: List[int]) -> List[int]:
+        """Soften dramatic slot-to-slot swings to avoid 4→1→5 coverage whiplash."""
+        if not targets:
+            return []
+        smoothed = list(targets)
+        for idx in range(1, len(smoothed)):
+            smoothed[idx] = max(minima[idx], min(smoothed[idx], smoothed[idx - 1] + 2))
+        for idx in range(len(smoothed) - 2, -1, -1):
+            smoothed[idx] = max(minima[idx], min(smoothed[idx], smoothed[idx + 1] + 2))
+        final: List[int] = []
+        for idx, value in enumerate(smoothed):
+            window = smoothed[max(0, idx - 1) : min(len(smoothed), idx + 2)]
+            blended = (value * 2 + sum(window) / len(window)) / 3.0
+            final.append(max(minima[idx], int(round(blended))))
+        return final
 
     def _role_wage(self, role_name: str) -> float:
         if role_name in self.wage_overrides:
@@ -532,6 +686,21 @@ class ScheduleGenerator:
             except (TypeError, ValueError):
                 pass
         return hourly_wage(self.policy, role_name, 0.0)
+
+    def _employee_role_wage(self, employee: Optional[Dict[str, Any]], role_name: str) -> float:
+        if employee:
+            overrides = employee.get("wage_overrides") or {}
+            target = normalize_role(role_name)
+            for key, value in overrides.items():
+                try:
+                    wage = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not wage:
+                    continue
+                if normalize_role(key) == target:
+                    return wage
+        return self._role_wage(role_name)
 
     def _adjust_block_window(
         self,
@@ -566,7 +735,7 @@ class ScheduleGenerator:
             anchor_end=end_dt,
         )
         if window_override:
-            _anchored_start, end_dt = window_override
+            start_dt, end_dt = window_override
         return start_dt, end_dt
 
 
@@ -607,16 +776,18 @@ class ScheduleGenerator:
     ) -> List[Tuple[datetime.datetime, datetime.datetime]]:
         if block_label not in {"open", "mid", "pm"}:
             return []
-        day_token = WEEKDAY_TOKENS[date_value.weekday()]
         group_name = self._canonical_group(role_group(role_name))
-        templates = self.pattern_templates.get(group_name) or self.pattern_templates.get(role_name)
-        if not isinstance(templates, dict):
-            return []
-        day_spec = templates.get(day_token) or templates.get("default")
-        if not isinstance(day_spec, dict):
-            return []
         block_key = "am" if block_label in {"open", "mid"} else "pm"
-        windows = day_spec.get(block_key)
+        day_token = WEEKDAY_TOKENS[date_value.weekday()]
+        override = self.shift_presets.get(group_name) or self.shift_presets.get(role_name) or {}
+        templates = self.pattern_templates.get(group_name) or self.pattern_templates.get(role_name) or {}
+        day_spec = templates.get(day_token) or templates.get("default") if isinstance(templates, dict) else {}
+        if isinstance(override, dict) and block_key in override:
+            windows = override.get(block_key)
+        elif isinstance(day_spec, dict):
+            windows = day_spec.get(block_key)
+        else:
+            windows = []
         parsed: List[Tuple[datetime.datetime, datetime.datetime]] = []
         if not isinstance(windows, list):
             return parsed
@@ -638,6 +809,55 @@ class ScheduleGenerator:
                 parsed_window = (anchored_start, anchored_end)
             parsed.append(parsed_window)
         return parsed
+
+    def _window_subset_for_slots(
+        self, windows: List[Tuple[datetime.datetime, datetime.datetime]], slots: int, day_index: int
+    ) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+        """Pick a deterministic subset of pattern windows to spread starts instead of front-loading."""
+        if not windows or slots <= 0:
+            return []
+        count = len(windows)
+        if slots >= count:
+            return list(windows)
+        # Rotate by day index so different weekdays do not always consume the earliest windows.
+        rotated = list(windows[day_index % count :]) + list(windows[: day_index % count])
+        if slots == 1:
+            return [rotated[0]]
+        indices: List[int] = []
+        for i in range(slots):
+            idx = math.floor(i * (len(rotated) - 1) / (slots - 1))
+            if idx not in indices:
+                indices.append(idx)
+        subset = [rotated[idx] for idx in indices]
+        return subset[:slots]
+
+    def _constrain_windows_to_block(
+        self,
+        windows: List[Tuple[datetime.datetime, datetime.datetime]],
+        block_start: datetime.datetime,
+        block_end: datetime.datetime,
+        block_label: str,
+        role_name: str,
+    ) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+        """Clamp pattern windows to the resolved block window so non-openers don't start before open/close."""
+        adjusted: List[Tuple[datetime.datetime, datetime.datetime]] = []
+        for start_dt, end_dt in windows:
+            duration = end_dt - start_dt
+            if duration.total_seconds() <= 0:
+                continue
+            new_start = start_dt
+            new_end = end_dt
+            if block_label not in {"open", "close"}:
+                # Prevent mids/PMs from starting before the block start (e.g., before open).
+                if new_start < block_start:
+                    new_start = block_start
+                    new_end = new_start + duration
+            if new_end > block_end:
+                new_end = block_end
+            if new_end <= new_start:
+                continue
+            adjusted.append((new_start, new_end))
+        return adjusted
 
     def _parse_pattern_window(
         self, date_value: datetime.date, window: Dict[str, Any]
@@ -760,20 +980,21 @@ class ScheduleGenerator:
             if budget is None or budget <= 0:
                 continue
             total_cost = sum(self._slot_cost(demand) * demand.need for demand in payload["demands"])
-            ratio = total_cost / budget if budget > 0 else 0.0
-            if ratio <= 1.0:
+            locked_cost = sum(self._locked_slot_cost(demand) for demand in payload["demands"])
+            base_budget = max(budget, locked_cost)
+            allowed_max = max(budget * (1 + self.labor_budget_tolerance), locked_cost)
+            if total_cost <= allowed_max + 1e-6:
                 continue
-            soft_mode = ratio <= (1.0 + self.labor_budget_tolerance + 1e-6)
-            allowed_max = budget * (1 + self.labor_budget_tolerance)
+            soft_mode = (total_cost / base_budget) <= (1.0 + self.labor_budget_tolerance + 1e-6)
             demand_index = 1.0
             if 0 <= day_index < len(self.day_contexts):
                 demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
-            # Do not clamp budgets on "slow" days; allow full allocation + tolerance.
-            # Trim-aggressive ratio is only used if explicitly > 1.0 (over-allocate); otherwise leave headroom intact.
-            if ratio > 1.0:
-                for demand in payload["demands"]:
-                    if not self._is_anchor_demand(demand):
-                        demand.minimum = min(demand.minimum, 0)
+            for demand in payload["demands"]:
+                if demand.allow_cuts and not self._is_anchor_demand(demand):
+                    demand.minimum = min(demand.minimum, 0)
+            adjustable_budget = max(0.0, allowed_max - locked_cost)
+            if adjustable_budget <= 0:
+                continue
             removable: List[Tuple[float, float, BlockDemand]] = []
             for demand in payload["demands"]:
                 if not demand.allow_cuts or demand.need <= demand.minimum:
@@ -876,6 +1097,274 @@ class ScheduleGenerator:
         block_label = demand.block_name.strip().lower()
         block_order = {"pm": 0, "mid": 1, "open": 2, "close": 3}.get(block_label, 4)
         return (block_order, -demand.priority, -self._slot_cost(demand))
+
+    def _locked_slot_cost(self, demand: BlockDemand) -> float:
+        slot_cost = self._slot_cost(demand)
+        if slot_cost <= 0:
+            return 0.0
+        locked_units = 0
+        if not demand.allow_cuts or self._is_anchor_demand(demand) or demand.always_on:
+            locked_units = max(demand.need, locked_units)
+        return slot_cost * max(0, locked_units)
+
+    def _rebalance_budget_targets(self, demands: List[BlockDemand]) -> None:
+        """Nudge cut windows so total cost better matches the configured budget."""
+        if not demands or not self.group_budget_by_day:
+            return
+        min_ratio = self.budget_target_ratio
+        max_ratio = 1.0 + self.labor_budget_tolerance
+        buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for demand in demands:
+            if demand.need <= 0 or not demand.allow_cuts:
+                continue
+            budget = self._group_budget_for_day(demand.day_index, demand.role_group)
+            if not budget or budget <= 0:
+                continue
+            key = (demand.day_index, demand.role_group)
+            bucket = buckets.setdefault(key, {"budget": budget, "demands": []})
+            bucket["demands"].append(demand)
+            bucket["cost"] = bucket.get("cost", 0.0) + (self._effective_slot_cost(demand) * max(0, demand.need))
+        if not buckets:
+            return
+        for (day_idx, group_name), payload in buckets.items():
+            budget = payload.get("budget", 0.0)
+            if budget <= 0:
+                continue
+            cost = payload.get("cost", 0.0)
+            ratio = cost / budget if budget else 1.0
+            if ratio < min_ratio - 0.01:
+                shortfall = (min_ratio * budget) - cost
+                self._extend_demands_for_budget(payload["demands"], shortfall)
+            elif ratio > max_ratio + 0.01:
+                excess = cost - (max_ratio * budget)
+                self._shrink_demands_for_budget(payload["demands"], excess)
+
+    def _effective_slot_cost(self, demand: BlockDemand) -> float:
+        end_time = demand.recommended_cut or demand.end
+        if not end_time or end_time <= demand.start:
+            return 0.0
+        hours = max(0.0, (end_time - demand.start).total_seconds() / 3600)
+        return hours * max(0.0, demand.hourly_rate or 0.0)
+
+    def _extend_demands_for_budget(self, bucket: List[BlockDemand], dollars_needed: float) -> None:
+        if dollars_needed <= 1.0 or not bucket:
+            return
+        ordered = sorted(bucket, key=lambda d: (-d.priority, d.start))
+        for demand in ordered:
+            if dollars_needed <= 0.5:
+                break
+            if not demand.recommended_cut or demand.recommended_cut >= demand.end:
+                continue
+            slack_minutes = int((demand.end - demand.recommended_cut).total_seconds() / 60)
+            if slack_minutes <= 0:
+                continue
+            per_minute = max(0.0, demand.hourly_rate or 0.0) * max(1, demand.need) / 60.0
+            if per_minute <= 0:
+                continue
+            extend_minutes = min(slack_minutes, int(math.ceil(dollars_needed / per_minute)))
+            if extend_minutes <= 0:
+                continue
+            demand.recommended_cut = demand.recommended_cut + datetime.timedelta(minutes=extend_minutes)
+            dollars_needed -= extend_minutes * per_minute
+            self._update_demand_cut_label(demand)
+            self._record_budget_rebalance_insight(demand, "extend", extend_minutes)
+
+    def _shrink_demands_for_budget(self, bucket: List[BlockDemand], dollars_to_trim: float) -> None:
+        if dollars_to_trim <= 1.0 or not bucket:
+            return
+        ordered = sorted(bucket, key=lambda d: (d.start, d.priority))
+        for demand in ordered:
+            if dollars_to_trim <= 0.5:
+                break
+            if demand.recommended_cut is None:
+                continue
+            min_hours, _ = shift_length_limits(self.policy, demand.role, demand.role_group)
+            min_duration = datetime.timedelta(minutes=int(min_hours * 60))
+            min_end = demand.start + min_duration
+            current_end = demand.recommended_cut
+            slack_minutes = int((current_end - min_end).total_seconds() / 60)
+            if slack_minutes <= 0:
+                continue
+            per_minute = max(0.0, demand.hourly_rate or 0.0) * max(1, demand.need) / 60.0
+            if per_minute <= 0:
+                continue
+            trim_minutes = min(slack_minutes, int(math.ceil(dollars_to_trim / per_minute)))
+            if trim_minutes <= 0:
+                continue
+            demand.recommended_cut = current_end - datetime.timedelta(minutes=trim_minutes)
+            dollars_to_trim -= trim_minutes * per_minute
+            self._update_demand_cut_label(demand)
+            self._record_budget_rebalance_insight(demand, "trim", trim_minutes)
+
+    def _update_demand_cut_label(self, demand: BlockDemand) -> None:
+        if not demand.recommended_cut:
+            return
+        existing = [label for label in demand.labels if not label.lower().startswith("cut around")]
+        label = f"cut around {demand.recommended_cut.strftime('%H:%M')}"
+        existing.append(label)
+        demand.labels = existing
+
+    def _record_budget_rebalance_insight(self, demand: BlockDemand, action: str, minutes: int) -> None:
+        if minutes <= 0:
+            return
+        self.cut_insights.append(
+            {
+                "day": self._day_label(demand.day_index),
+                "day_index": demand.day_index,
+                "role": demand.role,
+                "group": demand.role_group,
+                "block": demand.block_name,
+                "cut_time": (demand.recommended_cut or demand.end).isoformat(),
+                "score": demand.cut_score,
+                "factors": {**demand.cut_factors, "budget_adjustment": action},
+                "labels": list(demand.labels),
+            }
+        )
+
+    def _entry_start_rank(
+        self,
+        employee: Optional[Dict[str, Any]],
+        day_index: int,
+        default_start: int,
+    ) -> int:
+        if not employee:
+            return default_start
+        assignments = employee["assignments"].get(day_index, [])
+        if not assignments:
+            return default_start
+        return min(start for start, _ in assignments)
+
+    def _fifo_violation_state(
+        self,
+        entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]],
+        planned_end_times: List[datetime.datetime],
+        demand: BlockDemand,
+        start_minutes: int,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        ordering: List[Tuple[int, datetime.datetime, bool, int]] = []
+        for idx, (payload, employee) in enumerate(entries):
+            earliest = self._entry_start_rank(employee, demand.day_index, start_minutes)
+            locked = bool(payload.get("_followup_locked"))
+            ordering.append((earliest, planned_end_times[idx], locked, idx))
+        ordering.sort(key=lambda item: item[0])
+        tolerance = datetime.timedelta(minutes=self._fifo_tolerance_minutes())
+        violations: List[Dict[str, Any]] = []
+        locked_only = True
+        for first, second in zip(ordering, ordering[1:]):
+            if first[1] > second[1] + tolerance:
+                locked_pair = first[2] or second[2]
+                violations.append(
+                    {
+                        "prev_idx": first[3],
+                        "next_idx": second[3],
+                        "locked_pair": locked_pair,
+                    }
+                )
+                if not locked_pair:
+                    locked_only = False
+        return violations, locked_only
+
+    def _rebalance_fifo_entries(
+        self,
+        entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]],
+        planned_end_times: List[datetime.datetime],
+        demand: BlockDemand,
+        start_minutes: int,
+        min_duration: datetime.timedelta,
+        violations: List[Dict[str, Any]],
+    ) -> bool:
+        swappable: List[int] = [
+            idx for idx, (payload, _employee) in enumerate(entries) if not payload.get("_followup_locked")
+        ]
+        changed = False
+        if len(swappable) >= 2:
+            ranked = [
+                (self._entry_start_rank(entries[idx][1], demand.day_index, start_minutes), idx) for idx in swappable
+            ]
+            ranked.sort(key=lambda item: (item[0], planned_end_times[item[1]]))
+            target_indices = [idx for _score, idx in ranked]
+            sorted_endings = sorted([planned_end_times[idx] for idx in target_indices])
+            for idx, new_end in zip(target_indices, sorted_endings):
+                if planned_end_times[idx] != new_end:
+                    planned_end_times[idx] = new_end
+                    changed = True
+        tolerance = datetime.timedelta(minutes=self._fifo_tolerance_minutes())
+        if violations:
+            if self._force_fifo_adjustments(
+                entries,
+                planned_end_times,
+                demand.start,
+                min_duration,
+                demand.end,
+                tolerance,
+                violations,
+            ):
+                changed = True
+        return changed
+
+    def _fifo_tolerance_minutes(self) -> int:
+        return max(5, self.round_to_minutes)
+
+    def _force_fifo_adjustments(
+        self,
+        entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]],
+        planned_end_times: List[datetime.datetime],
+        block_start: datetime.datetime,
+        min_duration: datetime.timedelta,
+        block_end: datetime.datetime,
+        tolerance: datetime.timedelta,
+        violations: List[Dict[str, Any]],
+    ) -> bool:
+        changed = False
+        min_allowed_end = block_start + min_duration
+        for violation in violations:
+            prev_idx = violation["prev_idx"]
+            next_idx = violation["next_idx"]
+            prev_payload, _prev_employee = entries[prev_idx]
+            next_payload, _next_employee = entries[next_idx]
+            prev_locked = bool(prev_payload.get("_followup_locked"))
+            next_locked = bool(next_payload.get("_followup_locked"))
+            if not prev_locked:
+                candidate = planned_end_times[next_idx] - tolerance
+                if candidate > planned_end_times[prev_idx]:
+                    candidate = planned_end_times[prev_idx]
+                start_dt = prev_payload.get("start", block_start)
+                floor_time = max(min_allowed_end, start_dt + min_duration)
+                if candidate > floor_time and candidate < planned_end_times[prev_idx]:
+                    planned_end_times[prev_idx] = candidate
+                    changed = True
+                    continue
+        if prev_locked and not next_locked:
+            candidate = planned_end_times[prev_idx] + tolerance
+            if candidate < planned_end_times[next_idx]:
+                candidate = planned_end_times[next_idx]
+            if candidate > block_end:
+                candidate = block_end
+            if candidate > planned_end_times[next_idx]:
+                planned_end_times[next_idx] = candidate
+                changed = True
+        return changed
+
+    def _apply_cut_labels(
+        self,
+        planned_labels: List[List[str]],
+        planned_end_times: List[datetime.datetime],
+        base_labels: List[str],
+        early_indices: List[int],
+        final_indices: List[int],
+    ) -> None:
+        for idx in range(len(planned_labels)):
+            planned_labels[idx] = list(base_labels)
+        for idx in final_indices:
+            cut_time = planned_end_times[idx]
+            planned_labels[idx] = list(base_labels) + [f"final cut around {cut_time.strftime('%H:%M')}"]
+        if early_indices:
+            sorted_indices = sorted(early_indices, key=lambda i: planned_end_times[i])
+            for ordinal, idx in enumerate(sorted_indices, start=1):
+                cut_time = planned_end_times[idx]
+                planned_labels[idx] = list(base_labels) + [
+                    f"{self._ordinal_label(ordinal)} cut around {cut_time.strftime('%H:%M')}"
+                ]
 
     def _record_group_pressure(self, demands: List[BlockDemand]) -> None:
         """Estimate group-level budget pressure for dynamic cut targeting."""
@@ -1002,6 +1491,123 @@ class ScheduleGenerator:
         """Server roles cut order: patio -> dining -> cocktail."""
         return ["server - patio", "server - dining", "server - cocktail"]
 
+    def _role_cut_preferences(self, group: str) -> List[str]:
+        role_order = self.cut_priority_settings.get("role_order", {}) if self.cut_priority_settings else {}
+        custom = role_order.get(group)
+        if custom and (self.cut_priority_settings.get("enabled") or group == "Servers"):
+            return custom
+        if group == "Servers":
+            return self._server_cut_preference()
+        return []
+
+    @staticmethod
+    def _role_section_label(role: str) -> str:
+        label = normalize_role(role)
+        if "patio" in label:
+            return "Patio"
+        if "cocktail" in label or "bar" in label:
+            return "Cocktail"
+        if "dining" in label:
+            return "Dining"
+        return "Dining"
+
+    def _section_capacity_weight(self, demand: BlockDemand) -> float:
+        group_weights = self.section_capacity.get(demand.role_group)
+        if not isinstance(group_weights, dict):
+            return 1.0
+        section_label = self._role_section_label(demand.role)
+        try:
+            weight = float(group_weights.get(section_label, group_weights.get("default", 1.0)))
+        except (TypeError, ValueError):
+            weight = 1.0
+        return max(0.2, min(3.0, weight or 1.0))
+
+    def _role_preference_rank(self, demand: BlockDemand) -> int:
+        preferences = self._role_cut_preferences(demand.role_group)
+        normalized = normalize_role(demand.role)
+        try:
+            return preferences.index(normalized)
+        except ValueError:
+            return len(preferences)
+
+    def _cut_sort_key(self, demand: BlockDemand) -> Tuple[Any, ...]:
+        score = self._cut_pressure_score(demand)
+        pref_rank = self._role_preference_rank(demand)
+        return (
+            -score,
+            pref_rank,
+            demand.start,
+            -demand.priority,
+            demand.recommended_cut or demand.end,
+        )
+
+    def _cut_pressure_score(self, demand: BlockDemand) -> float:
+        day_idx = demand.day_index
+        pressure_ratio = self.group_pressure.get(day_idx, {}).get(demand.role_group, 1.0)
+        budget_component = max(0.0, pressure_ratio - 1.0)
+        demand_index = 1.0
+        if 0 <= day_idx < len(self.day_contexts):
+            demand_index = self.day_contexts[day_idx].get("indices", {}).get("demand_index", 1.0)
+        workload_component = max(0.0, demand_index - 0.5)
+        peak_component = max(0.0, self._block_progress_fraction(demand) - 0.6)
+        base_rank = self.cut_priority_rank.get(demand.role_group, 2)
+        score = (budget_component * 2.0) + (peak_component * 1.4) + (workload_component * 0.6) - (base_rank * 0.05)
+        capacity_weight = self._section_capacity_weight(demand)
+        demand.cut_factors = {
+            "budget_component": round(budget_component, 3),
+            "budget_gap": round(pressure_ratio - self.budget_target_ratio, 3),
+            "peak_component": round(peak_component, 3),
+            "workload_component": round(workload_component, 3),
+            "pressure_ratio": round(pressure_ratio, 3),
+            "demand_index": round(demand_index, 3),
+            "capacity_weight": round(capacity_weight, 3),
+        }
+        score = score / max(0.25, capacity_weight)
+        demand.cut_score = round(score, 3)
+        return score
+
+    def _block_progress_fraction(self, demand: BlockDemand) -> float:
+        if not demand.recommended_cut:
+            return 1.0
+        total = max(1.0, (demand.end - demand.start).total_seconds())
+        progressed = max(0.0, (demand.recommended_cut - demand.start).total_seconds())
+        return self._clamp(progressed / total, 0.0, 1.0)
+
+    @staticmethod
+    def _stagger_step_for_pressure(pressure: float) -> int:
+        step = 10
+        if pressure >= 1.1:
+            step = 15
+        if pressure >= 1.3:
+            step = 20
+        return step
+
+    def _assign_cut_for_demand(
+        self,
+        demand: BlockDemand,
+        pressure: float,
+        stagger_step: int,
+        offset: int,
+    ) -> bool:
+        slot_cut = demand.recommended_cut or demand.end
+        if not slot_cut:
+            return False
+        if pressure > 1.0:
+            extra_pull = int(min(120, 30 + (pressure - 1.0) * 90))
+            slot_cut = slot_cut - datetime.timedelta(minutes=extra_pull)
+        slot_cut = slot_cut - datetime.timedelta(minutes=stagger_step * offset)
+        min_hours, _ = shift_length_limits(self.policy, demand.role, demand.role_group)
+        min_duration = datetime.timedelta(minutes=int(min_hours * 60))
+        if slot_cut < demand.start + min_duration:
+            slot_cut = demand.start + min_duration
+        if slot_cut >= demand.end:
+            return False
+        demand.recommended_cut = slot_cut
+        label = f"cut around {slot_cut.strftime('%H:%M')}"
+        if label not in demand.labels:
+            demand.labels.append(label)
+        return True
+
     def _annotate_cut_windows(self, demands: List[BlockDemand]) -> None:
         if not demands:
             return
@@ -1019,57 +1625,36 @@ class ScheduleGenerator:
         if not candidates:
             return
 
-        # Second pass: stagger within each day/group to avoid all cuts firing at once
-        # and pull harder when a group is over budget for that day.
-        by_day_group: Dict[Tuple[int, str], List[BlockDemand]] = {}
-        for d in candidates:
-            key = (d.day_index, d.role_group)
-            by_day_group.setdefault(key, []).append(d)
+        # Second pass: stagger cuts within each day and optionally rotate across groups.
+        by_day: Dict[int, List[BlockDemand]] = {}
+        for demand in candidates:
+            by_day.setdefault(demand.day_index, []).append(demand)
 
-        for (day_idx, group), bucket in by_day_group.items():
-            pressure = self.group_pressure.get(day_idx, {}).get(group, 1.0)
-            stagger_step = 10
-            if pressure >= 1.1:
-                stagger_step = 15
-            if pressure >= 1.3:
-                stagger_step = 20
-
-            if group == "Servers":
-                preferences = self._server_cut_preference()
-
-                def sort_key(demand: BlockDemand) -> Tuple[Any, ...]:
-                    normalized = normalize_role(demand.role)
-                    try:
-                        pref_index = preferences.index(normalized)
-                    except ValueError:
-                        pref_index = len(preferences)
-                    return (pref_index, demand.start, -demand.priority, demand.recommended_cut or demand.end)
-
-            else:
-
-                def sort_key(demand: BlockDemand) -> Tuple[Any, ...]:
-                    return (demand.start, -demand.priority, demand.recommended_cut or demand.end)
-
-            bucket.sort(key=sort_key)
-            for offset, demand in enumerate(bucket):
-                slot_cut = demand.recommended_cut or demand.end
-                # Pull earlier if budget pressure is high for that group/day.
-                if pressure > 1.0:
-                    extra_pull = int(min(120, 30 + (pressure - 1.0) * 90))
-                    slot_cut = slot_cut - datetime.timedelta(minutes=extra_pull)
-                # Stagger to avoid simultaneous releases.
-                slot_cut = slot_cut - datetime.timedelta(minutes=stagger_step * offset)
-                # Enforce minimum shift length and not after original end.
-                min_hours, max_hours = shift_length_limits(self.policy, demand.role, demand.role_group)
-                min_duration = datetime.timedelta(minutes=int(min_hours * 60))
-                if slot_cut < demand.start + min_duration:
-                    slot_cut = demand.start + min_duration
-                if slot_cut >= demand.end:
-                    continue
-                demand.recommended_cut = slot_cut
-                label = f"cut around {slot_cut.strftime('%H:%M')}"
-                if label not in demand.labels:
-                    demand.labels.append(label)
+        for day_idx, bucket in by_day.items():
+            if not bucket:
+                continue
+            bucket.sort(key=lambda d: self._cut_sort_key(d))
+            group_offsets: Dict[str, int] = defaultdict(int)
+            for demand in bucket:
+                group = demand.role_group
+                pressure = self.group_pressure.get(day_idx, {}).get(group, 1.0)
+                stagger_step = self._stagger_step_for_pressure(pressure)
+                applied = self._assign_cut_for_demand(demand, pressure, stagger_step, group_offsets[group])
+                if applied:
+                    group_offsets[group] += 1
+                    self.cut_insights.append(
+                        {
+                            "day": self._day_label(day_idx),
+                            "day_index": day_idx,
+                            "role": demand.role,
+                            "group": demand.role_group,
+                            "block": demand.block_name,
+                            "cut_time": (demand.recommended_cut or demand.end).isoformat(),
+                            "score": demand.cut_score,
+                            "factors": demand.cut_factors.copy(),
+                            "labels": list(demand.labels),
+                        }
+                    )
 
     def _recommend_cut_time(self, demand: BlockDemand) -> Optional[datetime.datetime]:
         if self._is_closer_block(demand.role, demand.block_name):
@@ -1293,58 +1878,642 @@ class ScheduleGenerator:
             adjustment += add
         return adjustment
 
-    def _assign(self, demands: List[BlockDemand]) -> List[Dict[str, Any]]:
+    def _assign(self, demands: Dict[Tuple[int, str], Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert slot-level demand into template-anchored shifts, then assign employees.
+        Template starts are honored and only nudged by small steps to close coverage gaps.
+        """
+        self.unfilled_slots = []
+        if not demands:
+            return []
+        shift_plans: List[Dict[str, Any]] = []
+        roles_by_group = self._roles_by_group()
+        for (day_index, group_name), payload in sorted(demands.items()):
+            slots = payload.get("slots", [])
+            if not slots:
+                continue
+            templates = self._templates_for_group(group_name, day_index, payload.get("open"), payload.get("close"))
+            remaining = [slot["target"] for slot in slots]
+            used_starts: List[datetime.datetime] = []
+            while remaining and max(remaining) > 0:
+                peak_idx = self._peak_slot_index(remaining)
+                plan = self._build_shift_from_peak(slots, remaining, templates, peak_idx, group_name, used_starts)
+                if not plan:
+                    self.warnings.append(
+                        f"Unable to place shift for {group_name} on {slots[0]['date'].isoformat()} near "
+                        f"{slots[peak_idx]['start'].strftime('%H:%M')}"
+                    )
+                    break
+                used_starts.append(plan["start"])
+                self._apply_plan_to_remaining(plan, remaining, slots)
+                shift_plans.append(plan)
+            self._ensure_edge_shifts(
+                shift_plans,
+                slots,
+                group_name,
+                payload.get("open"),
+                payload.get("close"),
+            )
+        role_plans = self._map_plans_to_roles(shift_plans, roles_by_group)
+        return self._assign_employees(role_plans)
+
+    def _plan_coverage(self, plans: List[Dict[str, Any]], slots: List[Dict[str, Any]], group_name: str) -> List[int]:
+        coverage = [0 for _ in slots]
+        for plan in plans:
+            if plan.get("role_group") != group_name:
+                continue
+            indices = plan.get("slot_indices")
+            if not indices:
+                indices = self._slot_indices_for_range(slots, plan["start"], plan["end"])
+            for idx in indices:
+                if 0 <= idx < len(coverage):
+                    coverage[idx] += 1
+        return coverage
+
+    def _ensure_edge_shifts(
+        self,
+        plans: List[Dict[str, Any]],
+        slots: List[Dict[str, Any]],
+        group_name: str,
+        open_dt: datetime.datetime,
+        close_dt: datetime.datetime,
+    ) -> None:
+        if not slots:
+            return
+        coverage = self._plan_coverage(plans, slots, group_name)
+        minima = [slot["minimum"] for slot in slots]
+        targets = [slot["target"] for slot in slots]
+        essential_group = self._canonical_group(group_name) in {"Servers", "Server", "Bartenders", "Bartender", "Kitchen"}
+
+        def add_open():
+            start_dt = self._snap_datetime(open_dt - datetime.timedelta(minutes=45))
+            end_dt = min(close_dt, start_dt + datetime.timedelta(hours=max(MIN_SHIFT_HOURS, 6.0)))
+            plan = {
+                "day_index": slots[0]["day_index"],
+                "date": slots[0]["date"],
+                "role_group": group_name,
+                "style": "Open",
+                "start": start_dt,
+                "end": end_dt,
+                "template_start": start_dt,
+                "slot_indices": self._slot_indices_for_range(slots, start_dt, end_dt),
+                "essential": essential_group,
+            }
+            plans.append(plan)
+            return plan
+
+        def add_close():
+            end_dt = close_dt
+            start_dt = max(open_dt, end_dt - datetime.timedelta(hours=max(MIN_SHIFT_HOURS, 6.0)))
+            start_dt = self._snap_datetime(start_dt)
+            plan = {
+                "day_index": slots[0]["day_index"],
+                "date": slots[0]["date"],
+                "role_group": group_name,
+                "style": "Close",
+                "start": start_dt,
+                "end": end_dt,
+                "template_start": start_dt,
+                "slot_indices": self._slot_indices_for_range(slots, start_dt, end_dt),
+                "essential": essential_group,
+            }
+            plans.append(plan)
+            return plan
+
+        # Ensure opener coverage
+        if coverage[0] < minima[0] or coverage[0] < targets[0]:
+            added = add_open()
+            coverage = self._plan_coverage(plans, slots, group_name)
+            if (coverage[0] < minima[0] or coverage[0] < targets[0]) and added:
+                self.warnings.append(
+                    f"Opener coverage still low for {group_name} on {slots[0]['date'].isoformat()}; review manually."
+                )
+
+        # Ensure closer coverage
+        if coverage[-1] < minima[-1] or coverage[-1] < targets[-1]:
+            added = add_close()
+            coverage = self._plan_coverage(plans, slots, group_name)
+            if (coverage[-1] < minima[-1] or coverage[-1] < targets[-1]) and added:
+                self.warnings.append(
+                    f"Closer coverage still low for {group_name} on {slots[-1]['date'].isoformat()}; review manually."
+                )
+
+    @staticmethod
+    def _peak_slot_index(remaining: List[int]) -> int:
+        max_val = max(remaining) if remaining else 0
+        for idx, value in enumerate(remaining):
+            if value == max_val:
+                return idx
+        return 0
+
+    def _build_shift_from_peak(
+        self,
+        slots: List[Dict[str, Any]],
+        remaining: List[int],
+        templates: List[Dict[str, Any]],
+        peak_idx: int,
+        group_name: str,
+        used_starts: List[datetime.datetime],
+    ) -> Optional[Dict[str, Any]]:
+        if not slots or peak_idx >= len(slots) or peak_idx < 0:
+            return None
+        peak_start = slots[peak_idx]["start"]
+        candidates = [t for t in templates if t["start"] <= peak_start] or templates
+        if not candidates:
+            return None
+        template = max(candidates, key=lambda t: t["start"])
+        start_dt = self._snap_datetime(template["start"])
+        nudge_step = datetime.timedelta(minutes=max(15, self.round_to_minutes))
+        if used_starts and start_dt in used_starts and max(remaining) <= 1:
+            start_dt = self._snap_datetime(start_dt + nudge_step)
+        slot_start = slots[0]["start"]
+        slot_count = len(slots)
+        start_idx = int(max(0, (start_dt - slot_start).total_seconds() // HALF_HOUR.total_seconds()))
+        start_idx = min(start_idx, slot_count - 1)
+        min_slots = int(math.ceil(MIN_SHIFT_HOURS * 60 / 30))
+        max_slots = int(math.floor(MAX_SHIFT_HOURS * 60 / 30))
+        base_slots = int(round(max(1.0, float(template.get("hours", MIN_SHIFT_HOURS))) * 60 / 30))
+        window_start = start_idx
+        window_end = min(slot_count, start_idx + base_slots)
+        if peak_idx >= window_end:
+            window_end = min(slot_count, peak_idx + 1)
+        if peak_idx < window_start:
+            window_start = peak_idx
+        max_left_shift = 1  # limit to 30 minutes of movement away from the template anchor
+        min_window_start = max(0, start_idx - max_left_shift)
+        window_start = max(min_window_start, window_start)
+        if peak_idx < window_start:
+            window_start = peak_idx
+        window_end = max(window_end, window_start + min_slots)
+        if window_end > slot_count:
+            window_start = max(0, slot_count - min_slots)
+            window_end = slot_count
+        window_end = min(window_end, window_start + max_slots)
+        target_level = remaining[peak_idx]
+        while window_end < slot_count and window_end - window_start < max_slots:
+            if remaining[window_end] >= max(1, int(round(target_level * 0.6))):
+                window_end += 1
+            else:
+                break
+        while window_start > min_window_start and window_end - window_start < max_slots:
+            if remaining[window_start - 1] >= max(1, int(round(target_level * 0.6))):
+                window_start -= 1
+            else:
+                break
+        if window_end - window_start < min_slots:
+            deficit = min_slots - (window_end - window_start)
+            window_end = min(slot_count, window_end + deficit)
+            if window_end - window_start < min_slots and window_start > 0:
+                window_start = max(0, window_start - (min_slots - (window_end - window_start)))
+        window_end = min(slot_count, window_start + max(min_slots, window_end - window_start))
+        start_dt_final = slots[window_start]["start"]
+        end_dt_final = slots[window_end - 1]["end"] if window_end > window_start else slots[window_start]["end"]
+        return {
+            "day_index": slots[window_start]["day_index"],
+            "date": slots[window_start]["date"],
+            "role_group": group_name,
+            "style": template.get("style", "Mid"),
+            "start": start_dt_final,
+            "end": end_dt_final,
+            "template_start": template.get("start"),
+            "slot_indices": list(range(window_start, window_end)),
+        }
+
+    @staticmethod
+    def _apply_plan_to_remaining(plan: Dict[str, Any], remaining: List[int], slots: List[Dict[str, Any]]) -> None:
+        for idx in plan.get("slot_indices", []):
+            if 0 <= idx < len(remaining):
+                remaining[idx] = max(0, remaining[idx] - 1)
+
+    def _templates_for_group(
+        self, group_name: str, day_index: int, open_dt: Optional[datetime.datetime], close_dt: Optional[datetime.datetime]
+    ) -> List[Dict[str, Any]]:
+        canonical = self._canonical_group(group_name)
+        config = SHIFT_TEMPLATE_CONFIG.get(canonical, SHIFT_TEMPLATE_CONFIG.get(group_name, SHIFT_TEMPLATE_CONFIG.get("Servers", [])))
+        templates: List[Dict[str, Any]] = []
+        day_token = WEEKDAY_TOKENS[day_index]
+        for spec in config:
+            base_hours = float(spec.get("hours", MIN_SHIFT_HOURS) or MIN_SHIFT_HOURS)
+            if day_token in {"Fri", "Sat"}:
+                base_hours += 0.5
+            elif day_token == "Sun":
+                base_hours -= 0.25
+            start_dt = self._resolve_template_start(spec.get("time"), open_dt, close_dt)
+            if not start_dt or (close_dt and start_dt >= close_dt):
+                continue
+            templates.append({"style": spec.get("style", "Mid"), "start": start_dt, "hours": base_hours})
+        return sorted(templates, key=lambda item: item["start"])
+
+    def _resolve_template_start(
+        self, time_spec: Any, open_dt: Optional[datetime.datetime], close_dt: Optional[datetime.datetime]
+    ) -> Optional[datetime.datetime]:
+        if not open_dt:
+            return None
+        if isinstance(time_spec, str) and time_spec.lower().startswith("open"):
+            offset_minutes = 0
+            if "-" in time_spec or "+" in time_spec:
+                try:
+                    sign = -1 if "-" in time_spec else 1
+                    raw = time_spec.split("-", 1)[-1] if "-" in time_spec else time_spec.split("+", 1)[-1]
+                    hours, minutes = raw.split(":")
+                    offset_minutes = sign * ((int(hours) * 60) + int(minutes))
+                except (ValueError, IndexError):
+                    offset_minutes = 0
+            start_dt = open_dt + datetime.timedelta(minutes=offset_minutes)
+        elif isinstance(time_spec, str) and ":" in time_spec:
+            try:
+                hour, minute = [int(part) for part in time_spec.split(":", 1)]
+                start_dt = datetime.datetime.combine(open_dt.date(), datetime.time(hour, minute), tzinfo=UTC)
+                if close_dt and start_dt > close_dt and hour < 6:
+                    start_dt = start_dt - datetime.timedelta(days=1)
+            except ValueError:
+                return None
+        else:
+            return None
+        if close_dt and start_dt > close_dt:
+            start_dt = close_dt - datetime.timedelta(hours=MIN_SHIFT_HOURS)
+        day_start = datetime.datetime.combine(open_dt.date(), datetime.time.min, tzinfo=UTC)
+        if start_dt < day_start:
+            start_dt = day_start
+        return self._snap_datetime(start_dt)
+
+    def _snap_datetime(self, dt_value: datetime.datetime) -> datetime.datetime:
+        """Snap to nearest configured minute step to avoid non-template odd starts."""
+        base = datetime.datetime.combine(dt_value.date(), datetime.time.min, tzinfo=dt_value.tzinfo)
+        minutes = int((dt_value - base).total_seconds() // 60)
+        rounded = self._round_minutes(minutes)
+        return base + datetime.timedelta(minutes=rounded)
+
+    def _map_plans_to_roles(
+        self, plans: List[Dict[str, Any]], roles_by_group: Dict[str, List[str]]
+    ) -> List[Dict[str, Any]]:
+        mapped: List[Dict[str, Any]] = []
+        buckets: Dict[Tuple[int, str], List[Dict[str, Any]]] = defaultdict(list)
+        for plan in plans:
+            key = (plan["day_index"], plan["role_group"])
+            buckets[key].append(plan)
+        for (day_index, group_name), bucket in buckets.items():
+            canonical_group = self._canonical_group(group_name)
+            roles = roles_by_group.get(group_name, roles_by_group.get(canonical_group, []))
+            bucket_sorted = sorted(bucket, key=lambda p: (p["start"], SHIFT_STYLE_ORDER.get(p["style"], 5)))
+            essential_flags = {"server": False, "bartender": False, "expo": False}
+            for idx, plan in enumerate(bucket_sorted):
+                if canonical_group.startswith("Server"):
+                    role, is_floor = self._role_for_server_plan(idx, len(bucket_sorted), roles, plan)
+                    is_essential = is_floor and not essential_flags["server"]
+                    essential_flags["server"] = essential_flags["server"] or is_essential
+                elif canonical_group.startswith("Kitchen"):
+                    role, is_expo = self._role_for_kitchen_plan(idx, roles, plan)
+                    is_essential = is_expo and not essential_flags["expo"]
+                    essential_flags["expo"] = essential_flags["expo"] or is_essential
+                elif canonical_group.startswith("Bartender"):
+                    role = roles[0] if roles else plan.get("role") or "Bartender"
+                    is_essential = not essential_flags["bartender"]
+                    essential_flags["bartender"] = True
+                else:
+                    role = self._role_for_group_default(group_name, roles)
+                    is_essential = False
+                mapped.append({**plan, "role": role, "essential": is_essential, "role_group": canonical_group})
+        return sorted(mapped, key=lambda p: (p["day_index"], p["start"], p["end"]))
+
+    def _role_for_server_plan(
+        self, idx: int, total: int, roles: List[str], plan: Dict[str, Any]
+    ) -> Tuple[str, bool]:
+        dining_roles = [r for r in roles if "cocktail" not in r.lower()]
+        cocktail_roles = [r for r in roles if "cocktail" in r.lower()]
+        dining_roles = dining_roles or roles
+        cocktail_roles = cocktail_roles or roles
+        dining_target = max(1, int(round(total * 0.7)))
+        if idx < dining_target or plan.get("style") in {"Open", "Lunch"}:
+            return dining_roles[0], True
+        return cocktail_roles[0], False
+
+    def _role_for_kitchen_plan(self, idx: int, roles: List[str], plan: Dict[str, Any]) -> Tuple[str, bool]:
+        expo_roles = [r for r in roles if "expo" in r.lower() or "expeditor" in r.lower()]
+        grill_roles = [r for r in roles if "grill" in r.lower()]
+        if expo_roles:
+            if idx == 0 or plan.get("style") in {"Open", "Prep"}:
+                return expo_roles[0], True
+        if grill_roles:
+            return grill_roles[0], False
+        return (roles[0] if roles else plan.get("role") or "Kitchen"), False
+
+    def _role_for_group_default(self, group_name: str, roles: List[str]) -> str:
+        if roles:
+            return roles[0]
+        return group_name
+
+    def _assign_employees(self, plans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         assignments: List[Dict[str, Any]] = []
-        essential_batch: List[Tuple[BlockDemand, int]] = []
-        extra_batch: List[Tuple[BlockDemand, int]] = []
-        for demand in demands:
-            required = min(max(0, demand.minimum), demand.need)
-            remaining = max(0, demand.need - required)
-            if required > 0:
-                essential_batch.append((demand, required))
-            if remaining > 0:
-                extra_batch.append((demand, remaining))
-        essential_key: Callable[[Tuple[BlockDemand, int]], Tuple[Any, ...]] = lambda entry: (
-            entry[0].day_index,
-            entry[0].start,
-            -entry[0].priority,
-            entry[0].role,
-        )
-        extra_key: Callable[[Tuple[BlockDemand, int]], Tuple[Any, ...]] = lambda entry: (
-            -entry[0].priority,
-            entry[0].day_index,
-            entry[0].start,
-            entry[0].role,
-        )
-        assignments.extend(self._process_demand_batch(essential_batch, order_key=essential_key))
-        assignments.extend(self._process_demand_batch(extra_batch, order_key=extra_key))
+        for plan in plans:
+            demand = BlockDemand(
+                day_index=plan["day_index"],
+                date=plan["date"],
+                start=plan["start"],
+                end=plan["end"],
+                role=plan["role"],
+                block_name=plan.get("style", "Mid"),
+                labels=[plan.get("style", "Mid")],
+                need=1,
+                priority=1.0,
+                minimum=1,
+                allow_cuts=not plan.get("essential", False),
+                always_on=plan.get("essential", False),
+                role_group=plan["role_group"],
+                hourly_rate=self._role_wage(plan["role"]),
+            )
+            demand.recommended_cut = plan["end"]
+            candidate = self._select_employee(demand)
+            if candidate:
+                self._register_assignment(candidate, demand)
+            payload = self._build_assignment_payload(candidate if candidate else None, demand, override_end=plan["end"])
+            payload["location"] = plan.get("style", "Mid")
+            payload["notes"] = self._append_note(payload.get("notes"), "Template start")
+            if plan.get("essential"):
+                payload["notes"] = self._append_note(payload.get("notes"), "Essential coverage")
+            payload["_style"] = plan.get("style", "Mid")
+            payload["_role_group"] = plan.get("role_group")
+            payload["_slot_indices"] = plan.get("slot_indices", [])
+            payload["_essential"] = plan.get("essential", False)
+            assignments.append(payload)
+            if not candidate:
+                self.unfilled_slots.append({"payload": payload, "demand": demand})
         return assignments
 
-    def _process_demand_batch(
-        self,
-        batch: List[Tuple[BlockDemand, int]],
-        *,
-        order_key: Callable[[Tuple[BlockDemand, int]], Tuple[Any, ...]],
+    @staticmethod
+    def _slot_indices_for_range(slots: List[Dict[str, Any]], start: datetime.datetime, end: datetime.datetime) -> List[int]:
+        indices: List[int] = []
+        for idx, slot in enumerate(slots):
+            if start < slot["end"] and end > slot["start"]:
+                indices.append(idx)
+        return indices
+
+    def _apply_budget_cuts(
+        self, assignments: List[Dict[str, Any]], slot_matrix: Optional[Dict[Tuple[int, str], Dict[str, Any]]]
+    ) -> None:
+        """
+        Trim shifts from the back in 15/30-minute steps when a day/group is over budget.
+        Protects essential roles (one bartender, one expo, one floor server) and enforces
+        slot minima so coverage never falls below target - tolerance.
+        """
+        if not assignments:
+            return
+        matrix = slot_matrix or getattr(self, "current_slot_matrix", {}) or {}
+        coverage = self._build_coverage(assignments, matrix)
+        cut_order: Dict[Tuple[int, str], int] = defaultdict(int)
+        tolerance = 1
+        for (day_index, group_name), payload in sorted(matrix.items()):
+            slots = payload.get("slots", [])
+            if not slots:
+                continue
+            budget = None
+            if 0 <= day_index < len(self.group_budget_by_day):
+                budget = self.group_budget_by_day[day_index].get(group_name)
+            if budget is None or budget <= 0:
+                continue
+            open_dt = payload.get("open")
+            close_dt = payload.get("close")
+            current_cost = self._group_cost(assignments, group_name, open_dt, close_dt)
+            if current_cost <= budget:
+                continue
+            candidates = self._cut_candidates(assignments, group_name, open_dt, close_dt)
+            for shift in candidates:
+                if current_cost <= budget:
+                    break
+                for trim_minutes in (60, 30):
+                    if self._attempt_trim_shift(
+                        shift, trim_minutes, slots, coverage[(day_index, group_name)], tolerance
+                    ):
+                        cut_order[(day_index, group_name)] += 1
+                        ordinal = self._ordinal_label(cut_order[(day_index, group_name)])
+                        shift["notes"] = self._append_note(shift.get("notes"), f"{ordinal} cut")
+                        new_cost = self._compute_cost(shift["start"], shift["end"], shift.get("labor_rate", 0.0))
+                        self.cut_insights.append(
+                            {
+                                "day": slots[0]["date"].isoformat(),
+                                "role_group": group_name,
+                                "shift_start": shift["start"].isoformat(),
+                                "cut_time": shift["end"].isoformat(),
+                                "minutes_trimmed": trim_minutes,
+                            }
+                        )
+                        current_cost -= max(0.0, shift.get("labor_cost", 0.0) - new_cost)
+                        shift["labor_cost"] = new_cost
+                        break
+            coverage[(day_index, group_name)] = coverage.get((day_index, group_name), [])
+        self._log_coverage_tables(matrix, coverage)
+
+    def _group_cost(
+        self, assignments: List[Dict[str, Any]], group_name: str, open_dt: Optional[datetime.datetime], close_dt: Optional[datetime.datetime]
+    ) -> float:
+        total = 0.0
+        for shift in assignments:
+            shift_group = shift.get("_role_group") or self._canonical_group(role_group(shift.get("role")))
+            if shift_group != group_name:
+                continue
+            if not self._overlaps_window(shift, open_dt, close_dt):
+                continue
+            total += float(shift.get("labor_cost", 0.0) or 0.0)
+        return total
+
+    def _cut_candidates(
+        self, assignments: List[Dict[str, Any]], group_name: str, open_dt: Optional[datetime.datetime], close_dt: Optional[datetime.datetime]
     ) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        if not batch:
-            return results
-        for demand, count in sorted(batch, key=order_key):
-            entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
-            for _ in range(count):
-                candidate = self._select_employee(demand)
-                if not candidate:
-                    entries.append((self._build_assignment_payload(None, demand, override_end=demand.end), None))
-                    self.warnings.append(
-                        f"No coverage for {demand.role} on {demand.date.isoformat()} "
-                        f"{demand.start.strftime('%H:%M')} - {demand.end.strftime('%H:%M')} ({demand.block_name})"
-                    )
+        candidates: List[Dict[str, Any]] = []
+        for shift in assignments:
+            shift_group = shift.get("_role_group") or self._canonical_group(role_group(shift.get("role")))
+            if shift_group != group_name or shift.get("_essential"):
+                continue
+            if not self._overlaps_window(shift, open_dt, close_dt):
+                continue
+            candidates.append(shift)
+        return sorted(candidates, key=self._cut_sort_key_simple)
+
+    def _cut_sort_key_simple(self, shift: Dict[str, Any]) -> Tuple[Any, ...]:
+        style = shift.get("_style", "Mid")
+        role_label = (shift.get("role") or "").lower()
+        if "cocktail" in role_label:
+            role_rank = 0
+        elif "server" in role_label:
+            role_rank = 1
+        elif "kitchen" in role_label or "expo" in role_label or "grill" in role_label:
+            role_rank = 2
+        elif "bartender" in role_label:
+            role_rank = 3
+        else:
+            role_rank = 2
+        return (
+            SHIFT_STYLE_ORDER.get(style, 5),
+            shift.get("start"),
+            role_rank,
+            -(shift.get("end") - shift.get("start")).total_seconds(),
+        )
+
+    def _attempt_trim_shift(
+        self,
+        shift: Dict[str, Any],
+        trim_minutes: int,
+        slots: List[Dict[str, Any]],
+        coverage_row: List[int],
+        tolerance: int,
+    ) -> bool:
+        if trim_minutes <= 0 or not slots:
+            return False
+        new_end = shift["end"] - datetime.timedelta(minutes=trim_minutes)
+        if new_end <= shift["start"]:
+            return False
+        duration_hours = (new_end - shift["start"]).total_seconds() / 3600.0
+        if duration_hours < MIN_SHIFT_HOURS:
+            return False
+        trimmed_indices = self._slot_indices_for_range(slots, new_end, shift["end"])
+        if not trimmed_indices:
+            return False
+        for idx in trimmed_indices:
+            if idx >= len(coverage_row):
+                continue
+            if coverage_row[idx] - 1 < slots[idx]["minimum"]:
+                return False
+            if coverage_row[idx] - 1 < max(slots[idx]["target"] - tolerance, slots[idx]["minimum"]):
+                return False
+        for idx in trimmed_indices:
+            if idx < len(coverage_row):
+                coverage_row[idx] = max(0, coverage_row[idx] - 1)
+        shift["end"] = new_end
+        return True
+
+    def _build_coverage(
+        self, assignments: List[Dict[str, Any]], matrix: Dict[Tuple[int, str], Dict[str, Any]]
+    ) -> Dict[Tuple[int, str], List[int]]:
+        coverage: Dict[Tuple[int, str], List[int]] = {}
+        for key, payload in matrix.items():
+            coverage[key] = [0 for _ in payload.get("slots", [])]
+        for shift in assignments:
+            shift_group = shift.get("_role_group") or self._canonical_group(role_group(shift.get("role")))
+            for (day_index, group_name), payload in matrix.items():
+                if group_name != shift_group:
                     continue
-                self._register_assignment(candidate, demand)
-                entries.append((self._build_assignment_payload(candidate, demand, override_end=demand.end), candidate))
-            self._apply_staggered_cuts_for_demand(demand, entries)
-            results.extend(payload for payload, _ in entries)
-        return results
+                slots = payload.get("slots", [])
+                if not slots or not self._overlaps_window(shift, payload.get("open"), payload.get("close")):
+                    continue
+                for idx in self._slot_indices_for_range(slots, shift["start"], shift["end"]):
+                    if idx < len(coverage[(day_index, group_name)]):
+                        coverage[(day_index, group_name)][idx] += 1
+        return coverage
+
+    @staticmethod
+    def _overlaps_window(
+        shift: Dict[str, Any], start_dt: Optional[datetime.datetime], end_dt: Optional[datetime.datetime]
+    ) -> bool:
+        if not start_dt or not end_dt:
+            return True
+        return shift["start"] < end_dt and shift["end"] > start_dt
+
+    def _log_coverage_tables(
+        self, matrix: Dict[Tuple[int, str], Dict[str, Any]], coverage: Dict[Tuple[int, str], List[int]]
+    ) -> None:
+        """Print a simple time vs coverage table for visual validation."""
+        for day_index in range(7):
+            day_groups = [(key, payload) for key, payload in matrix.items() if key[0] == day_index]
+            if not day_groups:
+                continue
+            date_label = day_groups[0][1]["slots"][0]["date"].isoformat() if day_groups[0][1].get("slots") else ""
+            print(f"[coverage] {date_label}")
+            for (idx, group_name), payload in sorted(
+                day_groups, key=lambda item: item[1]["slots"][0]["start"] if item[1].get("slots") else datetime.datetime.min
+            ):
+                slots = payload.get("slots", [])
+                if not slots:
+                    continue
+                cov_row = coverage.get((idx, group_name), [0 for _ in slots])
+                hourly: List[str] = []
+                current_hour = None
+                bucket: List[int] = []
+                for slot, cov in zip(slots, cov_row):
+                    hour = slot["start"].replace(minute=0, second=0, microsecond=0)
+                    if current_hour is None:
+                        current_hour = hour
+                    if hour != current_hour:
+                        hourly.append(f"{current_hour.strftime('%H:%M')}:{max(bucket) if bucket else 0}")
+                        bucket = []
+                        current_hour = hour
+                    bucket.append(cov)
+                if bucket:
+                    hourly.append(f"{current_hour.strftime('%H:%M')}:{max(bucket)}")
+                print(f"  {group_name}: " + " ".join(hourly))
+
+    def _retry_unfilled_assignments(self, assignments: List[Dict[str, Any]]) -> None:
+        if not self.unfilled_slots:
+            return
+        remaining: List[Dict[str, Any]] = []
+        for slot in self.unfilled_slots:
+            payload = slot.get("payload")
+            demand = slot.get("demand")
+            if not payload or not isinstance(demand, BlockDemand):
+                continue
+            if payload.get("employee_id"):
+                continue
+            candidate = self._find_emergency_candidate(demand)
+            if not candidate:
+                remaining.append(slot)
+                continue
+            self._apply_recovery_assignment(candidate, demand, payload)
+        for slot in remaining:
+            demand = slot.get("demand")
+            if not isinstance(demand, BlockDemand):
+                continue
+            self.warnings.append(
+                f"No coverage for {demand.role} on {demand.date.isoformat()} "
+                f"{demand.start.strftime('%H:%M')} - {demand.end.strftime('%H:%M')} ({demand.block_name})"
+            )
+        self.unfilled_slots = []
+
+    def _find_emergency_candidate(self, demand: BlockDemand) -> Optional[Dict[str, Any]]:
+        ordered = sorted(self.employees, key=lambda record: record.get("total_hours", 0.0))
+        for employee in ordered:
+            if not self._employee_can_cover_role(employee, demand.role):
+                continue
+            if not self._employee_available(
+                employee,
+                demand,
+                allow_desired_overflow=True,
+                ignore_split=self.allow_split_shifts,
+            ):
+                continue
+            return employee
+        return None
+
+    def _apply_recovery_assignment(
+        self,
+        employee: Dict[str, Any],
+        demand: BlockDemand,
+        payload: Dict[str, Any],
+    ) -> None:
+        start_dt = payload.get("start", demand.start)
+        end_dt = payload.get("end", demand.end)
+        adjusted = BlockDemand(
+            day_index=demand.day_index,
+            date=demand.date,
+            start=start_dt,
+            end=end_dt,
+            role=demand.role,
+            block_name=demand.block_name,
+            labels=list(demand.labels),
+            need=1,
+            priority=demand.priority,
+            minimum=1,
+            allow_cuts=False,
+            always_on=demand.always_on,
+            role_group=demand.role_group,
+            hourly_rate=demand.hourly_rate,
+        )
+        adjusted.recommended_cut = end_dt
+        adjusted.max_capacity = 1
+        self._register_assignment(employee, adjusted)
+        rate = self._employee_role_wage(employee, demand.role)
+        payload["employee_id"] = employee.get("id")
+        payload["labor_rate"] = rate
+        payload["labor_cost"] = self._compute_cost(start_dt, end_dt, rate)
+        payload["notes"] = self._append_note(payload.get("notes"), "Recovered coverage")
 
     def _apply_staggered_cuts_for_demand(
         self,
@@ -1378,7 +2547,7 @@ class ScheduleGenerator:
 
         latest_cut = demand.recommended_cut
         if not demand.allow_cuts or not latest_cut:
-        # No cuts allowed or no recommended cut -> everyone works full block.
+            # No cuts allowed or no recommended cut -> everyone works full block.
             for payload, employee in entries:
                 end_time = demand.end
                 if end_time < demand.start + min_duration:
@@ -1473,36 +2642,22 @@ class ScheduleGenerator:
             if cut_time > latest_cut:
                 cut_time = latest_cut
             planned_end_times[idx] = cut_time
-            planned_labels[idx] = base_labels + [f"final cut around {cut_time.strftime('%H:%M')}"]
 
         if self.open_close_order_mode != "off" and len(entries) > 1:
-            ordering: List[Tuple[int, datetime.datetime]] = []
-            for idx, (_payload, employee) in enumerate(entries):
-                earliest = start_minutes
-                if employee:
-                    day_assignments = employee["assignments"].get(demand.day_index, [])
-                    if day_assignments:
-                        earliest = min([start for start, _ in day_assignments] + [start_minutes])
-                ordering.append((earliest, planned_end_times[idx]))
-            ordering.sort(key=lambda item: item[0])
-            violation = False
-            for first, second in zip(ordering, ordering[1:]):
-                if first[1] > second[1] + datetime.timedelta(minutes=2):
-                    violation = True
-                    break
-            if violation:
+            violations, locked_only = self._fifo_violation_state(entries, planned_end_times, demand, start_minutes)
+            if violations and not locked_only and self.open_close_order_mode in {"prefer", "enforce"}:
+                if self._rebalance_fifo_entries(
+                    entries, planned_end_times, demand, start_minutes, min_duration, violations
+                ):
+                    violations, locked_only = self._fifo_violation_state(
+                        entries, planned_end_times, demand, start_minutes
+                    )
+            if violations and not locked_only:
                 self.warnings.append(
                     f"Could not fully honor opener/closer order for {demand.role_group} on {self._day_label(demand.day_index)}; review cuts."
                 )
 
-        # Now assign "1st/2nd/3rd cut" based on actual chronological cut times.
-        if early_indices:
-            early_indices_by_time = sorted(early_indices, key=lambda i: planned_end_times[i])
-            for ordinal, idx in enumerate(early_indices_by_time, start=1):
-                cut_time = planned_end_times[idx]
-                planned_labels[idx] = base_labels + [
-                    f"{self._ordinal_label(ordinal)} cut around {cut_time.strftime('%H:%M')}"
-                ]
+        self._apply_cut_labels(planned_labels, planned_end_times, base_labels, early_indices, remaining_indices)
 
         for idx, (payload, employee) in enumerate(entries):
             self._finalize_assignment_payload(payload, employee, planned_end_times[idx], planned_labels[idx], demand)
@@ -1516,7 +2671,9 @@ class ScheduleGenerator:
         demand: BlockDemand,
     ) -> None:
         payload["end"] = end_time
-        payload["labor_cost"] = self._compute_cost(payload["start"], end_time, payload.get("labor_rate", 0.0))
+        rate = self._employee_role_wage(employee, demand.role)
+        payload["labor_rate"] = rate
+        payload["labor_cost"] = self._compute_cost(payload["start"], end_time, rate)
         payload["notes"] = ", ".join(labels)
         if employee and end_time < demand.end:
             delta_hours = max(0.0, (demand.end - end_time).total_seconds() / 3600)
@@ -1650,13 +2807,14 @@ class ScheduleGenerator:
         demand: BlockDemand,
         *,
         allow_desired_overflow: bool = False,
+        ignore_split: bool = False,
     ) -> bool:
         assignments = employee["assignments"][demand.day_index]
         demand_start_minutes, demand_end_minutes = self._demand_window_minutes(demand)
         for start_minute, end_minute in assignments:
             if demand_start_minutes < end_minute and demand_end_minutes > start_minute:
                 return False
-        if not self.allow_split_shifts and assignments:
+        if not self.allow_split_shifts and assignments and not ignore_split:
             return False
         for offset, seg_start, seg_end in self._demand_day_segments(demand):
             day_idx = (demand.day_index + offset) % 7
@@ -1857,14 +3015,41 @@ class ScheduleGenerator:
             break
 
     def _enforce_shift_continuity(self, assignments: List[Dict[str, Any]], week_start: datetime.date) -> None:
+        """
+        Merge back-to-back or overlapping shifts for the same employee/role on the same day.
+        Removes micro-fragments created by trimming and keeps coverage visually clean.
+        """
         if not assignments:
             return
-        day_map = defaultdict(list)
+        tolerance = datetime.timedelta(minutes=max(5, self.round_to_minutes))
+        grouped: Dict[Tuple[Any, str, datetime.date], List[Dict[str, Any]]] = defaultdict(list)
         for payload in assignments:
-            day_index = self._day_index_from_datetime(week_start, payload["start"])
-            day_map[day_index].append(payload)
-        self._ensure_opener_followups(day_map, assignments, week_start)
-        self._ensure_closer_continuity(day_map, assignments, week_start)
+            emp_id = payload.get("employee_id")
+            role_name = payload.get("role")
+            key = (emp_id, role_name, payload["start"].date())
+            grouped[key].append(payload)
+        merged: List[Dict[str, Any]] = []
+        for key, shifts in grouped.items():
+            shifts.sort(key=lambda s: s["start"])
+            current = shifts[0]
+            for nxt in shifts[1:]:
+                if nxt["start"] <= current["end"] + tolerance:
+                    current["end"] = max(current["end"], nxt["end"])
+                    current["labor_cost"] = self._compute_cost(
+                        current["start"], current["end"], current.get("labor_rate", 0.0)
+                    )
+                    if current.get("_slot_indices") and nxt.get("_slot_indices"):
+                        current["_slot_indices"] = sorted(
+                            set(current["_slot_indices"]).union(set(nxt["_slot_indices"]))
+                        )
+                    if current.get("notes") and nxt.get("notes"):
+                        current["notes"] = self._append_note(current["notes"], nxt["notes"])
+                    continue
+                merged.append(current)
+                current = nxt
+            merged.append(current)
+        assignments.clear()
+        assignments.extend(merged)
 
     def _ensure_opener_followups(
         self,
@@ -1988,7 +3173,10 @@ class ScheduleGenerator:
                 if not emp_id:
                     continue
                 op_day = self._closer_operational_day_index(week_start, shift["start"])
-                if self._closer_has_prior_assignment(emp_id, shift["start"], day_map.get(op_day, []), tolerance):
+                closer_group = role_group(shift.get("role"))
+                if self._closer_has_prior_assignment(
+                    emp_id, shift["start"], day_map.get(op_day, []), tolerance, closer_group
+                ):
                     continue
                 if self._pair_closer_with_existing(emp_id, shift, day_map.get(op_day, []), tolerance):
                     continue
@@ -2006,6 +3194,7 @@ class ScheduleGenerator:
         close_start: datetime.datetime,
         day_shifts: List[Dict[str, Any]],
         tolerance: datetime.timedelta,
+        closer_group: Optional[str],
     ) -> bool:
         if not day_shifts:
             return False
@@ -2014,6 +3203,8 @@ class ScheduleGenerator:
                 continue
             loc = (shift.get("location") or "").strip().lower()
             if loc in {"open", "close"}:
+                continue
+            if closer_group and role_group(shift.get("role")) != closer_group:
                 continue
             if shift["end"] > close_start - tolerance:
                 return True
@@ -2028,10 +3219,13 @@ class ScheduleGenerator:
     ) -> bool:
         if not day_shifts:
             return False
+        closer_group = role_group(close_shift.get("role"))
         candidates: List[Dict[str, Any]] = []
         for shift in day_shifts:
             loc = (shift.get("location") or "").strip().lower()
             if loc in {"open", "close"}:
+                continue
+            if closer_group and role_group(shift.get("role")) != closer_group:
                 continue
             if shift.get("employee_id") == employee_id:
                 if shift["end"] > close_shift["start"] - tolerance:
@@ -2091,7 +3285,8 @@ class ScheduleGenerator:
         location: str,
         note: str,
     ) -> Dict[str, Any]:
-        rate = self._role_wage(role_name)
+        employee = self.employee_lookup.get(employee_id) if employee_id else None
+        rate = self._employee_role_wage(employee, role_name)
         payload = {
             "employee_id": employee_id,
             "role": role_name,
@@ -2136,7 +3331,7 @@ class ScheduleGenerator:
         *,
         override_end: Optional[datetime.datetime] = None,
     ) -> Dict[str, Any]:
-        rate = self._role_wage(demand.role) if employee else 0.0
+        rate = self._employee_role_wage(employee, demand.role) if employee else 0.0
         start_time = demand.start
         end_time = override_end or demand.recommended_cut or demand.end
         if end_time <= start_time:
@@ -2187,6 +3382,7 @@ class ScheduleGenerator:
             "projected_budget_total": round(total_budget, 2),
             "policy_budget_ratio": round(budget_ratio, 4) if budget_ratio is not None else None,
             "warnings": [],
+            "cut_insights": list(self.cut_insights),
         }
 
     @staticmethod
