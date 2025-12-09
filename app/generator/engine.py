@@ -1185,10 +1185,47 @@ class ScheduleGenerator:
             Pick a cashier window that honors policy presets but delays starts when demand is low/slow.
             Earlier starts are only used when tier is high/peak.
             """
-            base_window = self._policy_preset_window("Cashier", "Cashier", period, frame) or self._resolve_pattern_window(
-                "Cashier", frame["weekday_token"], period, frame
-            ) or (min_start, max_end)
-            start_dt, end_dt = base_window
+            def _pattern_windows() -> List[Tuple[datetime.datetime, datetime.datetime]]:
+                templates = self.pattern_templates.get("Cashier", {})
+                day_template = templates.get(frame["weekday_token"]) or templates.get(
+                    frame["weekday_token"].capitalize()
+                ) or templates.get("default", {})
+                windows = day_template.get(period) if isinstance(day_template, dict) else None
+                if not windows and isinstance(templates.get("default"), dict):
+                    windows = templates["default"].get(period)
+                parsed: List[Tuple[datetime.datetime, datetime.datetime]] = []
+                if not windows or not isinstance(windows, list):
+                    return parsed
+                for entry in windows:
+                    if not isinstance(entry, dict):
+                        continue
+                    start = self._dt_from_label(frame["date"], entry.get("start"))
+                    end = self._dt_from_label(frame["date"], entry.get("end"))
+                    if not start or not end:
+                        continue
+                    if end <= start:
+                        end = end + datetime.timedelta(days=1)
+                    parsed.append((start, end))
+                return parsed
+
+            pattern_list = _pattern_windows()
+            preset_window = self._policy_preset_window("Cashier", "Cashier", period, frame)
+            # Choose a window: prefer pattern list (earliest for high/peak, latest for low/slow, middle for moderate).
+            window_choice: Optional[Tuple[datetime.datetime, datetime.datetime]] = None
+            if pattern_list:
+                if tier in {"low", "slow"}:
+                    window_choice = pattern_list[-1]
+                elif tier in {"high", "peak"}:
+                    window_choice = pattern_list[0]
+                else:
+                    mid_idx = min(len(pattern_list) - 1, len(pattern_list) // 2)
+                    window_choice = pattern_list[mid_idx]
+            elif preset_window:
+                window_choice = preset_window
+            else:
+                window_choice = (min_start, max_end)
+
+            start_dt, end_dt = window_choice
             start_dt = max(start_dt, min_start)
             end_dt = min(end_dt, max_end)
             offset_map = {"low": 45, "slow": 30, "moderate": 15, "high": 0, "peak": 0}
@@ -2011,7 +2048,10 @@ class ScheduleGenerator:
                 if not candidate and "hoh - opener" in normalize_role(demand.role):
                     candidate = self._select_any_kitchen(demand)
             if candidate:
-                self._register_assignment(candidate, demand)
+                if role_group(demand.role) == "Cashier" and self._is_management_only(candidate):
+                    candidate = None
+                else:
+                    self._register_assignment(candidate, demand)
             if pair_key:
                 pair_map[pair_key] = candidate.get("id") if candidate and isinstance(candidate, dict) else (
                     candidate if isinstance(candidate, int) else None
@@ -4045,6 +4085,8 @@ class ScheduleGenerator:
         if not self.manager_fallback_allowed:
             return False
         role_norm = normalize_role(demand.role)
+        if role_group(demand.role) == "Cashier":
+            return False
         if any(token in role_norm for token in self.manager_fallback_disallow):
             return False
         if "bartender" in role_norm or "expo" in role_norm or "opener" in role_norm or "closer" in role_norm:
@@ -4411,9 +4453,21 @@ class ScheduleGenerator:
                 continue
             if candidate_group == "Management" and target_group in {"Servers", "Bartenders"}:
                 continue
-            # Allow FOH coverage for Cashier when no direct cashier role exists.
-            if target_group == "Cashier" and candidate_group in {"Servers", "Bartenders", "Management"}:
-                return True
+            if target_group == "Cashier" and candidate_group == "Management":
+                continue
+            if target_group == "Cashier":
+                # Allow explicit all-roles cashier or any cashier-group role/covers.
+                if candidate_group == "Management":
+                    continue
+                if normalize_role(candidate) == normalize_role("Cashier - All Roles"):
+                    return True
+                if candidate_group == "Cashier":
+                    return True
+                candidate_cfg = role_definition(self.policy, candidate)
+                covers = candidate_cfg.get("covers") if isinstance(candidate_cfg, dict) else []
+                if covers and any(role_matches(cover, role_name) for cover in covers):
+                    return True
+                continue
             if target_group == "Kitchen":
                 if candidate_group not in {"Kitchen"}:
                     # Allow explicit cross-train only if the employee has the exact role.
@@ -4431,12 +4485,6 @@ class ScheduleGenerator:
             covers = candidate_cfg.get("covers") if isinstance(candidate_cfg, dict) else []
             if covers and role_name in covers:
                 return True
-        if target_group == "Cashier":
-            # Cashier can be covered by Servers/Bartenders/Managers when explicitly assigned.
-            for candidate in candidate_roles:
-                candidate_group = role_group(candidate)
-                if candidate_group in {"Servers", "Bartenders", "Management"}:
-                    return True
         if target_group and target_group in self.interchangeable_groups:
             for candidate in candidate_roles:
                 if role_group(candidate) == target_group:
@@ -4449,6 +4497,12 @@ class ScheduleGenerator:
                     if role_matches(candidate, qualifier):
                         return True
         return False
+
+    def _is_management_only(self, employee: Dict[str, Any]) -> bool:
+        roles = employee.get("roles") or []
+        if not roles:
+            return False
+        return all(role_group(role) == "Management" for role in roles)
 
     def _employee_available(
         self,
