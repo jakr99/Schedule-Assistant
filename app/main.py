@@ -5894,8 +5894,8 @@ class MainWindow(QMainWindow):
             on_status_updated=self._handle_validation_status_updated,
         )
         self.tabs.addTab(prep_tab, "Week Preparation")
-        self.tabs.addTab(self.week_schedule_page, "Week Schedule")
-        self.tabs.addTab(self.validation_page, "Validate / Import / Export")
+        self.tabs.addTab(self._wrap_tab(self.week_schedule_page), "Week Schedule")
+        self.tabs.addTab(self._wrap_tab(self.validation_page), "Validate / Import / Export")
         enabled = self.week_schedule_page.week_start is not None
         self.tabs.setTabEnabled(1, enabled)
         self.tabs.setTabEnabled(2, enabled)
@@ -5939,6 +5939,13 @@ class MainWindow(QMainWindow):
             details={"iso_year": iso_year, "iso_week": iso_week, "label": label},
         )
         self.reset_session_timers()
+
+    def _wrap_tab(self, widget: QWidget) -> QScrollArea:
+        """Wrap heavyweight tab content in a scroll area so everything stays reachable."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(widget)
+        return scroll_area
 
     def _handle_schedule_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
         computed_label = week_label(iso_year, iso_week)
