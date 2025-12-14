@@ -117,8 +117,18 @@ def pre_engine_settings(policy: Dict) -> Dict[str, Any]:
             if tolerance_pct <= 1:
                 tolerance_pct *= 100
             budget_cfg["tolerance_pct"] = max(0.0, tolerance_pct)
+        fallback_cfg = merged.get("fallback")
+        payload_fallback = payload.get("fallback") if isinstance(payload.get("fallback"), dict) else {}
+        if isinstance(fallback_cfg, dict) and isinstance(policy, dict) and "allow_mgr_fallback" in policy:
+            # Legacy compatibility: older payloads stored allow_mgr_fallback at the top level.
+            if "allow_mgr_fallback" not in payload_fallback:
+                fallback_cfg["allow_mgr_fallback"] = bool(policy.get("allow_mgr_fallback"))
         return merged
-    return copy.deepcopy(PRE_ENGINE_DEFAULTS)
+    merged = copy.deepcopy(PRE_ENGINE_DEFAULTS)
+    fallback_cfg = merged.get("fallback")
+    if isinstance(fallback_cfg, dict) and isinstance(policy, dict) and "allow_mgr_fallback" in policy:
+        fallback_cfg["allow_mgr_fallback"] = bool(policy.get("allow_mgr_fallback"))
+    return merged
 
 
 def required_roles(policy: Dict) -> List[str]:

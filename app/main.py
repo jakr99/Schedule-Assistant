@@ -11,6 +11,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
@@ -107,7 +111,6 @@ from policy import (
     pre_engine_settings,
     resolve_fallback_limits,
     resolve_hoh_thresholds,
-    resolve_section_weights,
     role_catalog,
 )
 from wages import (
@@ -125,6 +128,7 @@ from ui.week_view import WeekSchedulePage
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 ICON_FILE = Path(__file__).resolve().parents[1] / "project_image.ico"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 AUDIT_FILE = DATA_DIR / "audit.log"
@@ -3345,7 +3349,8 @@ class PolicyComposerDialog(QDialog):
             "Patio open (Patio ENABLED)",
             bool(seasonal_settings.get("server_patio_enabled", True)),
         )
-        fallback_cfg = self.policy_payload.get("fallback", {})
+        pre_engine_cfg = pre_engine_settings(self.policy_payload)
+        fallback_cfg = pre_engine_cfg.get("fallback", {}) if isinstance(pre_engine_cfg, dict) else {}
         self.fallback_allow_mgr = self._make_toggle_button(
             "Allow emergency manager coverage",
             bool(fallback_cfg.get("allow_mgr_fallback", True)),
@@ -3907,8 +3912,18 @@ class PolicyComposerDialog(QDialog):
         if patio_role is not None:
             patio_role["enabled"] = bool(seasonal_payload["server_patio_enabled"])
         self.policy_payload["section_capacity"] = self.section_capacity_editor.value()
+        allow_mgr_fallback = bool(self.fallback_allow_mgr.isChecked()) if hasattr(self, "fallback_allow_mgr") else True
+        pre_engine_payload = pre_engine_settings({**self.policy_payload, "allow_mgr_fallback": allow_mgr_fallback})
+        if isinstance(pre_engine_payload, dict):
+            limits = resolve_fallback_limits({"allow_mgr_fallback": allow_mgr_fallback})
+            fallback_payload = pre_engine_payload.setdefault("fallback", {})
+            if isinstance(fallback_payload, dict):
+                fallback_payload["allow_mgr_fallback"] = allow_mgr_fallback
+                fallback_payload["am_limit"] = limits.get("am", 1)
+                fallback_payload["pm_limit"] = limits.get("pm", 1)
         params = {
             "description": self.policy_payload.get("description", ""),
+            "allow_mgr_fallback": allow_mgr_fallback,
             "global": self.policy_payload["global"],
             "timeblocks": {
                 row["name"]: {"start": row["start"], "end": row["end"]} for row in self.policy_payload["timeblocks"]
@@ -3919,7 +3934,7 @@ class PolicyComposerDialog(QDialog):
             "shift_presets": self.policy_payload.get("shift_presets", {}),
             "section_capacity": self.policy_payload.get("section_capacity", {}),
             "anchors": self.policy_payload.get("anchors", {}),
-            "pre_engine": self.policy_payload.get("pre_engine", pre_engine_settings(self.policy_payload)),
+            "pre_engine": pre_engine_payload,
         }
         self.result_data = {"name": name, "params": params}
         super().accept()
@@ -4036,31 +4051,9 @@ class PolicyDialog(QDialog):
 
         self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
         layout.addWidget(self.shift_template_editor)
-        priority_row = QHBoxLayout()
-        priority_row.addWidget(QLabel("Section priority"))
-        self.section_priority_combo = QComboBox()
-        self.section_priority_combo.addItem("Normal", "normal")
-        self.section_priority_combo.addItem("Patio-light", "patio_light")
-        self.section_priority_combo.addItem("Cocktail-light", "cocktail_light")
-        self.section_priority_combo.addItem("Custom (dev)", "custom")
-        self.section_priority_combo.currentIndexChanged.connect(self._handle_section_priority_change)
-        priority_row.addWidget(self.section_priority_combo)
-        priority_row.addStretch(1)
-        layout.addLayout(priority_row)
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
+        self.section_capacity_editor.setVisible(False)
         layout.addWidget(self.section_capacity_editor)
-        seasonal_settings = self.policy_data.get("seasonal_settings", {})
-        fallback_cfg = self.policy_data.get("fallback", {})
-        # Reuse the patio toggle if it was already constructed; ensures a single source of truth.
-        if not hasattr(self, "patio_toggle"):
-            self.patio_toggle = self._make_toggle_button(
-                "Patio open (Toggle on/off)",
-                bool(seasonal_settings.get("server_patio_enabled", True)),
-            )
-        self.fallback_allow_mgr = self._make_toggle_button(
-            "Allow emergency manager coverage",
-            bool(fallback_cfg.get("allow_mgr_fallback", True)),
-        )
         self._build_pre_engine_section(layout)
         self.migration_notice = QLabel("Some deprecated settings were removed or converted automatically.")
         self.migration_notice.setStyleSheet(f"color:{INFO_COLOR};")
@@ -4071,19 +4064,16 @@ class PolicyDialog(QDialog):
         button_row.setSpacing(12)
         button_row.addStretch(1)
         seasonal_settings = self.policy_data.get("seasonal_settings", {})
-        fallback_cfg = self.policy_data.get("fallback", {})
-        # Reuse the single patio toggle (built earlier) so saved state matches the UI.
-        if not hasattr(self, "patio_toggle"):
-            self.patio_toggle = self._make_toggle_button(
-                "Toggle Patio - On is open",
-                bool(seasonal_settings.get("server_patio_enabled", True)),
-            )
+        self.patio_toggle = self._make_toggle_button(
+            "Patio open (Toggle on/off)",
+            bool(seasonal_settings.get("server_patio_enabled", True)),
+        )
         self.patio_toggle.setMinimumWidth(220)
         self.patio_toggle.setMaximumWidth(320)
         button_row.addWidget(self.patio_toggle)
         self.fallback_allow_mgr = self._make_toggle_button(
             "Allow emergency manager coverage",
-            bool(fallback_cfg.get("allow_mgr_fallback", True)),
+            bool(self.policy_data.get("allow_mgr_fallback", True)),
         )
         self.fallback_allow_mgr.setMinimumWidth(220)
         self.fallback_allow_mgr.setMaximumWidth(320)
@@ -4197,18 +4187,14 @@ class PolicyDialog(QDialog):
         self._populate_role_groups()
         self._apply_pre_engine_values()
         self._populate_role_groups()
-        priority = self.policy_data.get("section_priority", "normal")
-        idx = self.section_priority_combo.findData(priority)
-        if idx >= 0:
-            self.section_priority_combo.setCurrentIndex(idx)
-        else:
-            self.section_priority_combo.setCurrentIndex(0)
         # Seasonal / fallback toggles reflect loaded policy.
         seasonal_settings = self.policy_data.get("seasonal_settings", {})
-        fallback_cfg = self.policy_data.get("fallback", {})
         self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
-        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
-        self._handle_section_priority_change()
+        pre_engine_cfg = pre_engine_settings(self.policy_data)
+        fallback_cfg = pre_engine_cfg.get("fallback", {}) if isinstance(pre_engine_cfg, dict) else {}
+        allow_mgr_fallback = bool(fallback_cfg.get("allow_mgr_fallback", True))
+        self.policy_data["allow_mgr_fallback"] = allow_mgr_fallback
+        self.fallback_allow_mgr.setChecked(allow_mgr_fallback)
 
     def _sync_desired_range_bounds(self) -> None:
         if self.desired_ceiling_spin.value() < self.desired_floor_spin.value():
@@ -4267,19 +4253,6 @@ class PolicyDialog(QDialog):
             self.hoh_mode_combo.setCurrentIndex(idx)
         else:
             self.hoh_mode_combo.setCurrentIndex(0)
-        self.fallback_allow_mgr.setChecked(bool(self.policy_data.get("allow_mgr_fallback", fallback_cfg.get("allow_mgr_fallback", True))))
-    def _handle_section_priority_change(self) -> None:
-        choice = self.section_priority_combo.currentData()
-        if choice != "custom":
-            weights = resolve_section_weights({"section_priority": choice})
-            self.section_capacity_editor.set_config({"Servers": {
-                "Dining": weights["dining"],
-                "Patio": weights["patio"],
-                "Cocktail": weights["cocktail"],
-            }})
-            self.section_capacity_editor.setVisible(False)
-        else:
-            self.section_capacity_editor.setVisible(True)
 
     def _read_pre_engine_controls(self) -> Dict[str, Any]:
         cfg = pre_engine_settings(self.policy_data)
@@ -4501,16 +4474,12 @@ class PolicyDialog(QDialog):
     def _collect_policy_payload(self) -> Dict[str, Any]:
         name = self.name_input.text().strip() or "Store policy"
         description = self.description_input.text().strip()
-        self.policy_data["section_priority"] = self.section_priority_combo.currentData()
         self.policy_data["hoh_mode"] = self.hoh_mode_combo.currentData()
         self.policy_data["allow_mgr_fallback"] = self.fallback_allow_mgr.isChecked()
         # Keep seasonal/fallback toggles in sync with saved payload.
         seasonal_settings = self.policy_data.get("seasonal_settings", {}) or {}
         seasonal_settings["server_patio_enabled"] = bool(self.patio_toggle.isChecked())
         self.policy_data["seasonal_settings"] = seasonal_settings
-        fallback_cfg = self.policy_data.get("fallback", {}) or {}
-        fallback_cfg["allow_mgr_fallback"] = bool(self.fallback_allow_mgr.isChecked())
-        self.policy_data["fallback"] = fallback_cfg
         # Mirror patio toggle into the patio role enabled flag.
         patio_role = self.policy_data.get("roles", {}).get("Server - Patio", {})
         if isinstance(patio_role, dict):
@@ -4518,7 +4487,6 @@ class PolicyDialog(QDialog):
         params: Dict[str, Any] = {
             "name": name,
             "description": description,
-            "section_priority": self.section_priority_combo.currentData(),
             "hoh_mode": self.hoh_mode_combo.currentData(),
             "allow_mgr_fallback": self.fallback_allow_mgr.isChecked(),
             "global": {
@@ -4595,6 +4563,10 @@ class PolicyDialog(QDialog):
             data = json.loads(Path(file_path).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("Invalid policy file.")
+            if isinstance(data.get("params"), dict):
+                params = dict(data["params"])
+                params.setdefault("name", data.get("name") or params.get("policy_name") or "Imported Policy")
+                data = params
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Import failed", str(exc))
             return
