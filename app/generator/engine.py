@@ -4772,6 +4772,12 @@ class ScheduleGenerator:
             unique.append(payload)
         assignments[:] = unique
         tolerance = datetime.timedelta(minutes=max(5, self.round_to_minutes))
+
+        def _is_close_buffer_shift(payload: Dict[str, Any]) -> bool:
+            if (payload.get("location") or "").strip().lower() != "close":
+                return False
+            return "close buffer" in (payload.get("notes") or "").lower()
+
         grouped: Dict[Tuple[Any, str, datetime.date], List[Dict[str, Any]]] = defaultdict(list)
         for payload in assignments:
             emp_id = payload.get("employee_id")
@@ -4783,7 +4789,11 @@ class ScheduleGenerator:
             shifts.sort(key=lambda s: s["start"])
             current = shifts[0]
             for nxt in shifts[1:]:
-                if nxt["start"] <= current["end"] + tolerance and (current.get("location") == nxt.get("location")):
+                if (
+                    nxt["start"] <= current["end"] + tolerance
+                    and (current.get("location") == nxt.get("location"))
+                    and not (_is_close_buffer_shift(current) or _is_close_buffer_shift(nxt))
+                ):
                     current["end"] = max(current["end"], nxt["end"])
                     current["labor_cost"] = self._compute_cost(
                         current["start"], current["end"], current.get("labor_rate", 0.0)
