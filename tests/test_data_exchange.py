@@ -280,6 +280,46 @@ def test_copy_week_dataset_duplicates_projections(memory_db) -> None:
     assert target_rows[0].projected_notes == "carry"
 
 
+def test_copy_week_dataset_copies_shifts_when_ids_diverge(memory_db) -> None:
+    session = memory_db["session"]
+
+    # Pre-create WeekContext rows before WeekSchedule so the autoincrement ids diverge.
+    get_or_create_week_context(session, 2024, 1, "2024 W01")
+    source_ctx = get_or_create_week_context(session, 2024, 2, "2024 W02")
+
+    week_start = datetime.date.fromisocalendar(2024, 2, 1)
+    source_schedule = get_or_create_week(session, week_start)
+    assert source_schedule.context_id == source_ctx.id
+
+    session.add(
+        Shift(
+            week_id=source_schedule.id,
+            employee_id=None,
+            role="Server - Dining",
+            start=datetime.datetime(2024, 1, 8, 16, 0),
+            end=datetime.datetime(2024, 1, 8, 22, 0),
+            location="Mid",
+            notes="Copy me",
+            status="draft",
+            labor_rate=15.0,
+            labor_cost=90.0,
+        )
+    )
+    session.commit()
+
+    target_ctx = get_or_create_week_context(session, 2024, 3, "2024 W03")
+    summary = copy_week_dataset(session, source_ctx, target_ctx, "shifts", actor="tester")
+
+    target_start = datetime.date.fromisocalendar(2024, 3, 1)
+    target_schedule = get_or_create_week(session, target_start)
+    imported = session.scalars(select(Shift).where(Shift.week_id == target_schedule.id)).all()
+
+    assert summary == {"shifts": 1}
+    assert len(imported) == 1
+    assert imported[0].role == "Server - Dining"
+    assert imported[0].notes == "Copy me"
+
+
 def test_role_wages_export_import_round_trip(memory_db) -> None:
     # Seed a known wage value, export, clobber, and import back.
     wages.reset_wages_to_defaults()

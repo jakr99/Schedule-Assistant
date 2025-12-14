@@ -393,6 +393,7 @@ def copy_week_dataset(
     if dataset == "shifts":
         target_date = datetime.date.fromisocalendar(target_week.iso_year, target_week.iso_week, 1)
         source_date = datetime.date.fromisocalendar(source_week.iso_year, source_week.iso_week, 1)
+        source_schedule = get_or_create_week(session, source_date)
         export_path = EXPORT_DIR / f"temp_copy_{_timestamp()}.json"
         employees: Dict[int, str] = {}
         if employee_session:
@@ -415,7 +416,7 @@ def copy_week_dataset(
                         "labor_cost": shift.labor_cost,
                         "employee_name": employees.get(shift.employee_id),
                     }
-                    for shift in session.scalars(select(Shift).where(Shift.week_id == source_week.id))
+                    for shift in session.scalars(select(Shift).where(Shift.week_id == source_schedule.id))
                 ],
             }),
             encoding="utf-8",
