@@ -43,37 +43,37 @@ def _seed_policy(session_factory) -> None:
 
 
 def _seed_employees(session) -> List[int]:
-    """Create one employee for every required BWW role."""
-    roles = [
-        "Bartender,Bartender - Opener,Bartender - Closer",
-        "Bartender",
-        "Server - Opener,Server - Dining",
-        "Server - Opener,Server - Dining",
-        "Server - Dining Preclose",
-        "Server - Dining Closer",
-        "Server - Cocktail Preclose",
-        "Server - Cocktail Closer",
-        "Server - Dining",
-        "Server - Cocktail",
-        "HOH - Opener",
-        "HOH - Expo",
-        "HOH - Southwest",
-        "HOH - Chip",
-        "HOH - Shake",
-        "HOH - Grill",
-        "Cashier",
+    """Create a pool large enough for the generator to fully staff the week."""
+    role_sets = [
+        (
+            "Server",
+            "Server,Server - Dining,Server - Cocktail,Server - Opener,"
+            "Server - Dining Preclose,Server - Dining Closer,"
+            "Server - Cocktail Preclose,Server - Cocktail Closer",
+            20,
+        ),
+        ("Bartender", "Bartender,Bartender - Opener,Bartender - Closer", 6),
+        (
+            "Kitchen",
+            "HOH - Expo,HOH - Opener,HOH - Southwest,HOH - Grill,HOH - Chip,HOH - Shake",
+            8,
+        ),
+        ("Cashier", "Cashier", 4),
     ]
     employees: List[int] = []
-    for idx, role in enumerate(roles):
-        employee = Employee(
-            full_name=f"Auto {role} {idx}",
-            roles=role,
-            desired_hours=32,
-            status="active",
-        )
-        session.add(employee)
-        session.flush()
-        employees.append(employee.id)
+    idx = 0
+    for label, roles, count in role_sets:
+        for _ in range(count):
+            employee = Employee(
+                full_name=f"Auto {label} {idx}",
+                roles=roles,
+                desired_hours=48,
+                status="active",
+            )
+            session.add(employee)
+            session.flush()
+            employees.append(employee.id)
+            idx += 1
     session.commit()
     return employees
 

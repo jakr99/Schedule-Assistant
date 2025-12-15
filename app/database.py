@@ -714,6 +714,15 @@ def save_week_daily_projection_values(
         projection.projected_sales_amount = max(amount, 0.0)
         projection.projected_notes = notes.strip()
     projection_session.commit()
+    # Any edits to projections should invalidate a previously validated schedule.
+    week_context = _resolve_week_context(schedule_session, week_id)
+    if week_context:
+        try:
+            week_start = datetime.date.fromisocalendar(week_context.iso_year, week_context.iso_week, 1)
+            set_week_status(schedule_session, week_start, "draft")
+        except Exception:
+            # Projection edits should not hard-fail due to schedule status bookkeeping.
+            pass
     if close_projection:
         projection_session.close()
     if close_schedule:
@@ -789,7 +798,16 @@ def apply_saved_modifier_to_week(
         created_by=created_by,
     )
     session.add(modifier)
-    session.commit()
+    # Applying a modifier changes projections and should invalidate a previously validated schedule.
+    week_context = session.get(WeekContext, week_id)
+    if week_context:
+        try:
+            week_start = datetime.date.fromisocalendar(week_context.iso_year, week_context.iso_week, 1)
+            set_week_status(session, week_start, "draft")
+        except Exception:
+            session.commit()
+    else:
+        session.commit()
     session.refresh(modifier)
     return modifier
 

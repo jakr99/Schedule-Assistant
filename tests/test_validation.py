@@ -161,6 +161,33 @@ class ScheduleValidationTests(unittest.TestCase):
         hours_warnings = [w for w in report["warnings"] if w["type"] == "weekly_hours"]
         self.assertEqual(len(hours_warnings), 0)
 
+    def test_warns_when_shift_starts_after_pm_arrival_window(self) -> None:
+        employee = self._add_employee("Late Arrival", ["Server - Dining"])
+        self._add_shift(
+            role="Server - Dining",
+            start=datetime.datetime(2024, 4, 1, 18, 15, tzinfo=UTC),
+            end=datetime.datetime(2024, 4, 1, 22, 0, tzinfo=UTC),
+            employee=employee,
+        )
+
+        report = validate_week_schedule(self.session, self.week_start, employee_session=self.employee_session)
+        warnings = [warning for warning in report["warnings"] if warning["type"] == "arrival_window"]
+        self.assertTrue(warnings)
+        self.assertTrue(any(warning.get("level") == "max" for warning in warnings))
+
+    def test_does_not_warn_on_bartender_arrival_window(self) -> None:
+        employee = self._add_employee("Bartender Late", ["Bartender"])
+        self._add_shift(
+            role="Bartender",
+            start=datetime.datetime(2024, 4, 1, 18, 15, tzinfo=UTC),
+            end=datetime.datetime(2024, 4, 1, 22, 0, tzinfo=UTC),
+            employee=employee,
+        )
+
+        report = validate_week_schedule(self.session, self.week_start, employee_session=self.employee_session)
+        warnings = [warning for warning in report["warnings"] if warning["type"] == "arrival_window"]
+        self.assertEqual(len(warnings), 0)
+
     def _add_employee(self, name: str, roles: list[str]) -> Employee:
         employee = Employee(full_name=name, roles=", ".join(roles), desired_hours=30, status="active", notes="")
         self.employee_session.add(employee)

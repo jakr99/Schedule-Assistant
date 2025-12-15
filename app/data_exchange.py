@@ -225,6 +225,11 @@ def import_week_modifiers(session, week: WeekContext, file_path: Path, *, create
         session.add(modifier)
         added += 1
     session.commit()
+    try:
+        week_start = datetime.date.fromisocalendar(week.iso_year, week.iso_week, 1)
+        set_week_status(session, week_start, "draft")
+    except Exception:
+        pass
     return added
 
 
@@ -389,6 +394,11 @@ def copy_week_dataset(
             )
             count += 1
         session.commit()
+        try:
+            week_start = datetime.date.fromisocalendar(target_week.iso_year, target_week.iso_week, 1)
+            set_week_status(session, week_start, "draft")
+        except Exception:
+            pass
         return {"modifiers": count}
     if dataset == "shifts":
         target_date = datetime.date.fromisocalendar(target_week.iso_year, target_week.iso_week, 1)

@@ -18,7 +18,7 @@ if str(APP_DIR) not in sys.path:
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
-from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator, QFont
+from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator, QFont, QColor
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
@@ -123,6 +123,7 @@ from wages import (
     validate_wages,
     ALLOW_ZERO_ROLES,
 )
+from validation import validate_week_schedule
 from roles import ROLE_GROUPS, role_group, normalize_role
 from ui.week_view import WeekSchedulePage
 from ui.backup_dialog import BackupManagerDialog
@@ -1206,12 +1207,35 @@ class ValidationImportExportPage(QWidget):
         summary_layout.addRow("Projected labor", self.cost_label)
         layout.addWidget(summary_box)
 
-        validation_box = QGroupBox("Validation & warnings")
-        validation_layout = QVBoxLayout(validation_box)
-        self.validation_list = QListWidget()
-        self.validation_list.setAlternatingRowColors(True)
-        validation_layout.addWidget(self.validation_list)
-        layout.addWidget(validation_box)
+        checklist_box = QGroupBox("Validation checklist")
+        checklist_layout = QVBoxLayout(checklist_box)
+        self.checklist_table = QTableWidget(0, 2)
+        self.checklist_table.setHorizontalHeaderLabels(["Check", "Result"])
+        self.checklist_table.verticalHeader().setVisible(False)
+        self.checklist_table.horizontalHeader().setVisible(False)
+        self.checklist_table.setShowGrid(False)
+        self.checklist_table.setAlternatingRowColors(True)
+        self.checklist_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.checklist_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.checklist_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.checklist_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        checklist_layout.addWidget(self.checklist_table)
+        layout.addWidget(checklist_box)
+
+        findings_box = QGroupBox("Failures & warnings")
+        findings_layout = QVBoxLayout(findings_box)
+        self.findings_table = QTableWidget(0, 2)
+        self.findings_table.setHorizontalHeaderLabels(["Level", "Message"])
+        self.findings_table.verticalHeader().setVisible(False)
+        self.findings_table.horizontalHeader().setVisible(False)
+        self.findings_table.setShowGrid(False)
+        self.findings_table.setAlternatingRowColors(True)
+        self.findings_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.findings_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.findings_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.findings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        findings_layout.addWidget(self.findings_table)
+        layout.addWidget(findings_box)
 
         self.feedback_label = QLabel()
         self.feedback_label.setWordWrap(True)
@@ -1256,7 +1280,7 @@ class ValidationImportExportPage(QWidget):
         controls = QHBoxLayout()
         controls.setSpacing(10)
         self.validate_button = QPushButton("Run validation")
-        self.validate_button.clicked.connect(self._run_validation)
+        self.validate_button.clicked.connect(lambda: self._run_validation(mark_validated=True))
         controls.addWidget(self.validate_button)
 
         self.export_format = QComboBox()
@@ -1326,26 +1350,7 @@ class ValidationImportExportPage(QWidget):
             self.copy_week_button.setEnabled(bool(dataset) and dataset != "employees" and has_week)
 
     def _refresh_validation_notes(self) -> None:
-        self.validation_list.clear()
-        week_start = self._current_week_start()
-        if not week_start:
-            return
-        with self.session_factory() as session:
-            summary = get_week_summary(session, week_start)
-            shifts = get_shifts_for_week(session, week_start)
-            policy = load_active_policy_spec(self.session_factory)
-        empty_days = [day["date"] for day in summary.get("days", []) if day.get("count", 0) == 0]
-        if empty_days:
-            self.validation_list.addItem(f"No coverage scheduled for: {', '.join(empty_days)}")
-        unassigned = [s for s in shifts if not s.get("employee_id")]
-        if unassigned:
-            self.validation_list.addItem(f"{len(unassigned)} unassigned shift(s) remain.")
-        missing_wages = validate_wages(role_catalog(policy))
-        if missing_wages:
-            roles_list = ", ".join(sorted(missing_wages.keys()))
-            self.validation_list.addItem(f"Wages missing/unchecked for: {roles_list}")
-        if summary.get("total_cost", 0) <= 0:
-            self.validation_list.addItem("No labor cost recorded yet. Validate after generating schedule.")
+        self._run_validation(mark_validated=False)
 
     def _handle_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
@@ -1354,44 +1359,107 @@ class ValidationImportExportPage(QWidget):
         if self.on_week_changed:
             self.on_week_changed(iso_year, iso_week, label)
 
-    def _run_validation(self) -> None:
-        self.results_list.clear()
+    def _run_validation(self, *, mark_validated: bool = False) -> None:
         week_start = self._current_week_start()
         if not week_start:
+            self.checklist_table.setRowCount(0)
+            self.findings_table.setRowCount(0)
             self._set_feedback("Select a week to validate.", WARNING_COLOR)
             return
-        with self.session_factory() as session:
-            summary = get_week_summary(session, week_start)
-            shifts = get_shifts_for_week(session, week_start)
-        errors: List[str] = []
-        if summary.get("total_shifts", 0) == 0:
-            errors.append("No shifts scheduled for the selected week.")
-        for day in summary.get("days", []):
-            if day.get("count", 0) == 0:
-                errors.append(f"No coverage scheduled for {day.get('date')}.")
-        for shift in shifts:
-            if not shift.get("employee_id"):
-                start = shift.get("start")
-                label = self._format_shift_label(start)
-                errors.append(f"{shift.get('role')} shift starting {label} is unassigned.")
-        if errors:
-            for message in errors:
-                self.results_list.addItem(f"Error: {message}")
-            self._set_feedback("Validation failed. Resolve the errors highlighted above.", ERROR_COLOR)
+
+        with self.session_factory() as session, self.employee_session_factory() as employee_session:
+            report = validate_week_schedule(session, week_start, employee_session=employee_session)
+
+        policy = load_active_policy_spec(self.session_factory)
+        missing_wages = validate_wages(role_catalog(policy))
+        warnings = list(report.get("warnings") or [])
+        if missing_wages:
+            roles_list = ", ".join(sorted(missing_wages.keys()))
+            warnings.append(
+                {
+                    "type": "wages",
+                    "severity": "warning",
+                    "message": f"Wages missing/unchecked for: {roles_list}",
+                }
+            )
+
+        issues = list(report.get("issues") or [])
+        checks = list(report.get("checks") or [])
+
+        self.checklist_table.setRowCount(0)
+        status_font = QFont()
+        status_font.setBold(True)
+        for row_index, entry in enumerate(checks):
+            label = str(entry.get("label") or "").strip() or "Check"
+            status = str(entry.get("status") or "fail").strip().lower()
+            details = str(entry.get("details") or "").strip()
+
+            self.checklist_table.insertRow(row_index)
+            label_item = QTableWidgetItem(label)
+            if details:
+                label_item.setToolTip(details)
+            self.checklist_table.setItem(row_index, 0, label_item)
+
+            status_item = QTableWidgetItem("OK" if status == "ok" else "FAIL")
+            status_item.setTextAlignment(int(Qt.AlignRight | Qt.AlignVCenter))
+            status_item.setFont(status_font)
+            status_item.setForeground(QColor(SUCCESS_COLOR if status == "ok" else ERROR_COLOR))
+            self.checklist_table.setItem(row_index, 1, status_item)
+
+        self.findings_table.setRowCount(0)
+        findings: List[Dict[str, Any]] = []
+        findings.extend([dict(entry, severity="error") for entry in issues if isinstance(entry, dict)])
+        findings.extend([dict(entry, severity="warning") for entry in warnings if isinstance(entry, dict)])
+
+        def _severity_rank(entry: Dict[str, Any]) -> int:
+            return 0 if str(entry.get("severity") or "").lower() == "error" else 1
+
+        findings.sort(key=_severity_rank)
+        for row_index, entry in enumerate(findings):
+            severity = str(entry.get("severity") or "warning").strip().lower()
+            message = str(entry.get("message") or "").strip()
+            self.findings_table.insertRow(row_index)
+
+            level_text = "FAIL" if severity == "error" else "WARNING"
+            level_color = ERROR_COLOR if severity == "error" else WARNING_COLOR
+            level_item = QTableWidgetItem(level_text)
+            level_item.setFont(status_font)
+            level_item.setForeground(QColor(level_color))
+            self.findings_table.setItem(row_index, 0, level_item)
+
+            message_item = QTableWidgetItem(message)
+            self.findings_table.setItem(row_index, 1, message_item)
+
+        error_count = sum(
+            1 for entry in issues if isinstance(entry, dict) and str(entry.get("severity") or "").lower() == "error"
+        )
+        if error_count:
+            self._set_feedback(f"Validation failed ({error_count} issue(s)).", ERROR_COLOR)
             self._refresh_summary()
             return
-        self.results_list.addItem("Validation complete. Week is ready for export.")
-        self._set_feedback("All checks passed. Week marked as validated.", SUCCESS_COLOR)
-        self._apply_week_status("validated")
-        audit_logger.log(
-            "week_validated",
-            self.user.get("username", "unknown"),
-            role=self.user.get("role"),
-            details={
-                "iso_year": self.active_week.get("iso_year"),
-                "iso_week": self.active_week.get("iso_week"),
-            },
-        )
+
+        if mark_validated:
+            self._apply_week_status("validated")
+            summary = "All checks passed. Week marked as validated."
+            if warnings:
+                summary = f"Week validated with {len(warnings)} warning(s)."
+            self._set_feedback(summary, SUCCESS_COLOR)
+            audit_logger.log(
+                "week_validated",
+                self.user.get("username", "unknown"),
+                role=self.user.get("role"),
+                details={
+                    "iso_year": self.active_week.get("iso_year"),
+                    "iso_week": self.active_week.get("iso_week"),
+                    "warnings": len(warnings),
+                },
+            )
+        else:
+            message = "Validation report updated."
+            if warnings:
+                message = f"Validation report updated with {len(warnings)} warning(s)."
+            self._set_feedback(message, INFO_COLOR)
+        self._refresh_summary()
 
     def _handle_export(self) -> None:
         status = (self.summary_data.get("status") or "draft").lower()
@@ -1947,6 +2015,7 @@ class DemandPlanningWidget(QWidget):
 
         self.modifier_feedback = QLabel()
         self.modifier_feedback.setStyleSheet(f"color:{INFO_COLOR};")
+        self.modifier_feedback.setVisible(False)
         modifier_layout.addWidget(self.modifier_feedback)
 
         modifier_buttons = QHBoxLayout()
@@ -1999,6 +2068,7 @@ class DemandPlanningWidget(QWidget):
 
         self.saved_feedback_label = QLabel()
         self.saved_feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
+        self.saved_feedback_label.setVisible(False)
         library_layout.addWidget(self.saved_feedback_label)
         self._update_saved_modifier_buttons()
         return self.saved_modifier_group
@@ -2318,6 +2388,11 @@ class DemandPlanningWidget(QWidget):
         for button in (self.apply_saved_button, self.delete_saved_button):
             button.setEnabled(has_selection)
 
+    def _set_feedback(self, label: QLabel, message: str, *, color: str) -> None:
+        label.setStyleSheet(f"color:{color};")
+        label.setText(message or "")
+        label.setVisible(bool((message or "").strip()))
+
     def _refresh_saved_modifier_panel(self) -> None:
         if not hasattr(self, "saved_modifier_list"):
             return
@@ -2345,8 +2420,7 @@ class DemandPlanningWidget(QWidget):
             pct_change=current.pct_change,
             notes=current.notes or "",
         )
-        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.modifier_feedback.setText(f"Saved '{current.title}' for future weeks.")
+        self._set_feedback(self.modifier_feedback, f"Saved '{current.title}' for future weeks.", color=SUCCESS_COLOR)
         self.refresh()
 
     def handle_apply_saved_modifier(self) -> None:
@@ -2371,8 +2445,11 @@ class DemandPlanningWidget(QWidget):
             role=self.actor.get("role"),
             details={"template_id": template.id, "modifier_id": modifier.id},
         )
-        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.modifier_feedback.setText(f"Added '{template.title}' to {self.week_label}.")
+        self._set_feedback(
+            self.modifier_feedback,
+            f"Added '{template.title}' to {self.week_label}.",
+            color=SUCCESS_COLOR,
+        )
         self.refresh()
 
     def handle_delete_saved_modifier(self) -> None:
@@ -2394,7 +2471,7 @@ class DemandPlanningWidget(QWidget):
             role=self.actor.get("role"),
             details={"template_id": template.id, "title": template.title},
         )
-        self.saved_feedback_label.setText(f"Deleted saved modifier '{template.title}'.")
+        self._set_feedback(self.saved_feedback_label, f"Deleted saved modifier '{template.title}'.", color=ACCENT_COLOR)
         self.refresh()
 
     def _create_saved_template(
@@ -2427,7 +2504,7 @@ class DemandPlanningWidget(QWidget):
             details={"template_id": template.id, "title": template.title},
         )
         if hasattr(self, "saved_feedback_label"):
-            self.saved_feedback_label.setText(f"Saved '{title}' for future weeks.")
+            self._set_feedback(self.saved_feedback_label, f"Saved '{title}' for future weeks.", color=SUCCESS_COLOR)
 
     def handle_add_modifier(self) -> None:
         dialog = ModifierDialog(self.modifiers)
@@ -2452,7 +2529,12 @@ class DemandPlanningWidget(QWidget):
                 created_by=self.actor.get("username", "unknown"),
             )
             session.add(modifier)
-            session.commit()
+            iso_year = self.active_week.get("iso_year")
+            iso_week = self.active_week.get("iso_week")
+            if isinstance(iso_year, int) and isinstance(iso_week, int):
+                set_week_status(session, week_start_date(iso_year, iso_week), "draft")
+            else:
+                session.commit()
             session.refresh(modifier)
         audit_logger.log(
             "modifier_create",
@@ -2469,8 +2551,7 @@ class DemandPlanningWidget(QWidget):
                 "pct_change": modifier.pct_change,
             },
         )
-        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.modifier_feedback.setText(f"Added modifier '{modifier.title}'.")
+        self._set_feedback(self.modifier_feedback, f"Added modifier '{modifier.title}'.", color=SUCCESS_COLOR)
         if data.get("save_for_later"):
             self._create_saved_template(
                 title=data["title"],
@@ -2509,7 +2590,12 @@ class DemandPlanningWidget(QWidget):
             modifier.end_time = data["end_time"]
             modifier.pct_change = pct_change
             modifier.notes = notes_value
-            session.commit()
+            iso_year = self.active_week.get("iso_year")
+            iso_week = self.active_week.get("iso_week")
+            if isinstance(iso_year, int) and isinstance(iso_week, int):
+                set_week_status(session, week_start_date(iso_year, iso_week), "draft")
+            else:
+                session.commit()
         audit_logger.log(
             "modifier_update",
             self.actor.get("username"),
@@ -2525,8 +2611,7 @@ class DemandPlanningWidget(QWidget):
                 "pct_change": pct_change,
             },
         )
-        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.modifier_feedback.setText(f"Updated modifier '{data['title']}'.")
+        self._set_feedback(self.modifier_feedback, f"Updated modifier '{data['title']}'.", color=SUCCESS_COLOR)
         if data.get("save_for_later"):
             self._create_saved_template(
                 title=data["title"],
@@ -2554,7 +2639,12 @@ class DemandPlanningWidget(QWidget):
             modifier = session.get(Modifier, current.id)
             if modifier:
                 session.delete(modifier)
-                session.commit()
+                iso_year = self.active_week.get("iso_year")
+                iso_week = self.active_week.get("iso_week")
+                if isinstance(iso_year, int) and isinstance(iso_week, int):
+                    set_week_status(session, week_start_date(iso_year, iso_week), "draft")
+                else:
+                    session.commit()
         audit_logger.log(
             "modifier_delete",
             self.actor.get("username"),
@@ -2565,8 +2655,7 @@ class DemandPlanningWidget(QWidget):
                 "title": current.title,
             },
         )
-        self.modifier_feedback.setStyleSheet(f"color:{ACCENT_COLOR};")
-        self.modifier_feedback.setText(f"Deleted modifier '{current.title}'.")
+        self._set_feedback(self.modifier_feedback, f"Deleted modifier '{current.title}'.", color=ACCENT_COLOR)
         self.refresh()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]

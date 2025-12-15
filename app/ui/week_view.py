@@ -39,6 +39,7 @@ from database import (
     list_modifiers_for_week,
     list_roles,
     record_audit_log,
+    set_week_status,
     shift_display_date,
     upsert_shift,
 )
@@ -50,6 +51,8 @@ from ui.edit_shift import EditShiftDialog
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ROLE_GROUP_ORDER = ["Kitchen", "Servers", "Bartenders", "Cashier", "Other"]
+SHIFT_ROLE_GROUP_ORDER = ["Kitchen", "Bartenders", "Servers", "Cashier", "Other"]
+SHIFT_ROLE_GROUP_PRIORITY = {group: idx for idx, group in enumerate(SHIFT_ROLE_GROUP_ORDER)}
 
 
 class ColorDelegate(QStyledItemDelegate):
@@ -455,6 +458,14 @@ class WeekSchedulePage(QWidget):
                 continue
             by_day.setdefault(day_index, []).append(shift)
 
+        def sort_key(item: Dict) -> Tuple:
+            start = item.get("start")
+            group = role_group(item.get("role")) or "Other"
+            group_priority = SHIFT_ROLE_GROUP_PRIORITY.get(group, len(SHIFT_ROLE_GROUP_ORDER))
+            role_name = (item.get("role") or "").lower()
+            employee_name = (item.get("employee_name") or "").lower()
+            return (start, group_priority, role_name, employee_name, item.get("id") or 0)
+
         selected_set = set(self.selected_shift_ids)
         for idx, column in enumerate(self.day_columns):
             list_widget: QListWidget = column["list"]
@@ -463,7 +474,7 @@ class WeekSchedulePage(QWidget):
             list_widget.clear()
             date_value = (self.week_start + datetime.timedelta(days=idx)) if self.week_start else None
             header_label.setText(f"{DAY_NAMES[idx]}\n{date_value.isoformat() if date_value else ''}")
-            for shift in sorted(by_day.get(idx, []), key=lambda item: item["start"]):
+            for shift in sorted(by_day.get(idx, []), key=sort_key):
                 text = self._format_shift_text(shift)
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, shift["id"])
@@ -664,7 +675,7 @@ class WeekSchedulePage(QWidget):
                 QMessageBox.warning(self, "Swap owners", "Unable to load the selected shifts.")
                 return
             shift_a.employee_id, shift_b.employee_id = shift_b.employee_id, shift_a.employee_id
-            session.commit()
+            set_week_status(session, self.week_start, "draft")
             record_audit_log(
                 session,
                 self.user.get("username", "unknown"),
@@ -701,7 +712,8 @@ class WeekSchedulePage(QWidget):
                 db_shift = session.get(Shift, shift_id)
                 if db_shift:
                     db_shift.employee_id = employee["id"]
-            session.commit()
+            if self.week_start:
+                set_week_status(session, self.week_start, "draft")
             record_audit_log(
                 session,
                 self.user.get("username", "unknown"),
@@ -772,7 +784,7 @@ class WeekSchedulePage(QWidget):
                 elif not note:
                     note = tag
                 shift.notes = note
-            session.commit()
+            set_week_status(session, self.week_start, "draft")
             record_audit_log(
                 session,
                 self.user.get("username", "unknown"),

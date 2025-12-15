@@ -212,6 +212,8 @@ def upsert_week_projection(
             )
         )
     db.commit()
+    # Projections/modifier edits invalidate any previously validated schedule for the week.
+    set_week_status(db, start_date, "draft")
     _audit(db, actor=payload.get("actor") or "api", action="WEEK_PROJECTION_SAVE", target=str(context.id), payload={})
 
     projections = get_week_summary(db, start_date)
